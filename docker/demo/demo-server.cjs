@@ -4,6 +4,10 @@
  * 零依赖 Node 22+。启动：node demo-server.js（默认 :8093）
  *
  * 环境变量：DEMO_PORT / SEALOS_KUBECONFIG_PATH / DSH_IMAGE / DSH_CPU / DSH_MEM
+ * 产品模式（对应网关 v0.4，可测 workspace 锁定 + 预设隐藏）：
+ *   GW_PRODUCT_MODE=1        创建容器时注入产品模式
+ *   GW_ADMIN_TOKEN=xxx       平台管理令牌（demo-server 以平台视角调用 /settings 时携带 X-GW-Admin）
+ *   GW_PRESET_BACKGROUND=... GW_PRESET_MEMORY=...  平台预设，注入容器 env
  * 密钥安全：代码零硬编码。DEEPSEEK_API_KEY / ACR_USER / ACR_PASS 通过
  *   ① 页面「配置」面板提交（存本进程内存，重启即失，不落盘）；或
  *   ② 可选的 docker/demo/.env（已被 .gitignore 忽略，勿提交）。
@@ -29,9 +33,18 @@ const KUBECONFIG_PATH = process.env.SEALOS_KUBECONFIG_PATH
   || (fs.existsSync(path.join(__dirname, "kubeconfig.yaml")) ? path.join(__dirname, "kubeconfig.yaml") : "");
 const KUBECONFIG_ABS = path.isAbsolute(KUBECONFIG_PATH) ? KUBECONFIG_PATH : path.join(__dirname, KUBECONFIG_PATH);
 const AUTH = encodeURIComponent(fs.readFileSync(KUBECONFIG_ABS, "utf8"));
-const IMAGE = process.env.DSH_IMAGE || "registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:1.2.0";
+const IMAGE = process.env.DSH_IMAGE || "registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:1.3.0";
 const CPU = Number(process.env.DSH_CPU || 1);
 const MEM = Number(process.env.DSH_MEM || 2);
+
+// 产品模式：demo-server 充当平台（kitsume 后端的角色）
+const ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
+const PRODUCT_ENV = [
+  process.env.GW_PRODUCT_MODE === "1" ? { name: "GW_PRODUCT_MODE", value: "1" } : null,
+  ADMIN_TOKEN ? { name: "GW_ADMIN_TOKEN", value: ADMIN_TOKEN } : null,
+  process.env.GW_PRESET_BACKGROUND ? { name: "GW_PRESET_BACKGROUND", value: process.env.GW_PRESET_BACKGROUND } : null,
+  process.env.GW_PRESET_MEMORY ? { name: "GW_PRESET_MEMORY", value: process.env.GW_PRESET_MEMORY } : null,
+].filter(Boolean);
 
 /** 敏感配置：仅存内存（session），可通过页面 /api/config 更新，永不写盘、永不提交 */
 const CONFIG = {
@@ -81,10 +94,10 @@ function readBody(req, limit = 1 << 20) {
 }
 
 async function gwFetch(ws, p, opts = {}) {
-  return fetch(`${ws.publicAddress}${p}`, {
-    ...opts,
-    headers: { "X-GW-Token": ws.gwToken, "Content-Type": "application/json", ...(opts.headers || {}) },
-  });
+  const headers = { "X-GW-Token": ws.gwToken, "Content-Type": "application/json", ...(opts.headers || {}) };
+  // demo 以平台视角调用（网关 v0.4 产品模式下可读写预设）
+  if (ADMIN_TOKEN) headers["X-GW-Admin"] = ADMIN_TOKEN;
+  return fetch(`${ws.publicAddress}${p}`, { ...opts, headers });
 }
 
 function getWs(name) {
@@ -137,6 +150,7 @@ const server = http.createServer(async (req, res) => {
         env: [
           { name: "GW_TOKEN", value: gwToken },
           { name: "DEEPSEEK_API_KEY", value: CONFIG.deepseekKey },
+          ...PRODUCT_ENV,
         ],
         storage: [
           { name: "dsh-home", path: "/home/node/.dsh", size: "1Gi" },
