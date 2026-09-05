@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>狐分身 DSH 工作台 Demo</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; background: #141414; color: #e8e6e3; min-height: 100vh; padding: 24px 16px; }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 19px; font-weight: 600; margin-bottom: 2px; }
+  .sub { color: #9a968f; font-size: 12px; margin-bottom: 18px; }
+  .card { background: #1e1e1e; border: 1px solid #2e2e2e; border-radius: 12px; padding: 18px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; font-weight: 500; margin-bottom: 12px; color: #c9c6c0; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button { background: #2563eb; color: #fff; border: none; border-radius: 8px; padding: 8px 16px; font-size: 13px; cursor: pointer; font-weight: 500; }
+  button:hover { background: #1d4ed8; }
+  button:disabled { background: #333; color: #777; cursor: not-allowed; }
+  button.secondary { background: #2e2e2e; }
+  button.secondary:hover { background: #3a3a3a; }
+  button.danger { background: #7f1d1d; }
+  button.danger:hover { background: #991b1b; }
+  input[type=text], select, textarea { background: #141414; border: 1px solid #333; color: #e8e6e3; border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit; }
+  input[type=text] { flex: 1; min-width: 200px; }
+  textarea { width: 100%; resize: vertical; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: #2563eb; }
+  label { font-size: 12px; color: #9a968f; display: block; margin: 10px 0 4px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+  .steps { margin-top: 12px; font-size: 13px; line-height: 2; }
+  .step { display: flex; align-items: center; gap: 8px; color: #9a968f; }
+  .step.active { color: #fbbf24; }
+  .step.done { color: #34d399; }
+  .step.fail { color: #f87171; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #444; flex-shrink: 0; }
+  .step.active .dot { background: #fbbf24; animation: blink 1s infinite; }
+  .step.done .dot { background: #34d399; }
+  .step.fail .dot { background: #f87171; }
+  @keyframes blink { 50% { opacity: 0.3; } }
+  .meta { font-size: 12px; color: #9a968f; word-break: break-all; }
+  .chat { display: flex; flex-direction: column; gap: 10px; max-height: 400px; overflow-y: auto; margin-bottom: 12px; }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: #2563eb; color: #fff; border-bottom-right-radius: 4px; }
+  .msg.bot { align-self: flex-start; background: #2a2a2a; border-bottom-left-radius: 4px; }
+  .msg.bot .events { color: #8a867f; font-size: 11px; margin-top: 8px; border-top: 1px dashed #3a3a3a; padding-top: 6px; max-height: 120px; overflow-y: auto; }
+  .status { font-size: 12px; color: #9a968f; min-height: 16px; }
+  .hidden { display: none; }
+  .err { color: #f87171; font-size: 12px; margin-top: 8px; }
+  .ok { color: #34d399; font-size: 12px; margin-top: 8px; }
+  .apps { font-size: 12px; line-height: 1.9; }
+  .apps button { padding: 2px 10px; font-size: 11px; margin-left: 8px; }
+  .cfgDot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .cfgDot.on { background: #34d399; } .cfgDot.off { background: #f87171; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>狐分身 · DSH 工作台 Demo</h1>
+  <div class="sub">镜像 eftik-dsh-cloud:1.2.0（网关 v0.3）· Sealos 一键创建 · 全接口演示</div>
+
+  <div class="card">
+    <div class="row">
+      <button id="btnCreate">一键创建工作台</button>
+      <span class="meta">1C / 2G · 双 PVC · 平台统一 Key</span>
+    </div>
+    <div class="steps hidden" id="steps">
+      <div class="step" id="st1"><span class="dot"></span>调用 Sealos API 创建应用</div>
+      <div class="step" id="st2"><span class="dot"></span>拉取镜像 / 启动容器</div>
+      <div class="step" id="st3"><span class="dot"></span>网关就绪（健康检查）</div>
+    </div>
+    <div class="err hidden" id="createErr"></div>
+    <div class="meta hidden" id="appInfo"></div>
+  </div>
+
+  <div class="card hidden" id="wsCard">
+    <h2>我的工作台</h2>
+    <div class="meta" id="wsMeta"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="danger" id="btnDeleteWs">删除工作台</button>
+      <span class="meta">删除后 PVC 数据不可恢复</span>
+    </div>
+  </div>
+
+  <div class="card hidden" id="settingsCard">
+    <h2>工作台设置（/settings）</h2>
+    <div class="grid">
+      <div>
+        <label>模型 model</label>
+        <input type="text" id="sModel" placeholder="留空 = 默认 deepseek-v4-flash">
+      </div>
+      <div>
+        <label>权限模式 permissionMode</label>
+        <select id="sPerm">
+          <option value="read-only">read-only（只读沙箱）</option>
+          <option value="workspace-write">workspace-write（可写工作区，默认）</option>
+          <option value="danger-full-access">danger-full-access（全权免审批）</option>
+        </select>
+      </div>
+      <div>
+        <label>推理等级 reasoning</label>
+        <select id="sReason">
+          <option value="low">low（简洁直接）</option>
+          <option value="balanced">balanced（默认）</option>
+          <option value="high">high（深入思考）</option>
+        </select>
+      </div>
+    </div>
+    <label>角色背景 background（人设，注入每次任务）</label>
+    <textarea id="sBg" rows="3" placeholder="例：你叫狐仙，是狐分身产品的AI助手，说话简洁专业，永远用中文。"></textarea>
+    <label>长期记忆 memory（用户偏好/事实）</label>
+    <textarea id="sMem" rows="2" placeholder="例：用户是产品经理，偏好表格化展示。"></textarea>
+    <div class="row" style="margin-top:10px">
+      <button id="btnSaveSettings">保存设置</button>
+      <button class="secondary" id="btnResetSettings">重置默认</button>
+    </div>
+    <div class="err hidden" id="settingsErr"></div>
+    <div class="ok hidden" id="settingsOk"></div>
+  </div>
+
+  <div class="card hidden" id="chatCard">
+    <h2>对话（POST /chat → GET /task 或 SSE）</h2>
+    <div class="chat" id="chatLog"></div>
+    <div class="row">
+      <input type="text" id="chatInput" placeholder="给分身派个活，例如：在 workspace 写一个贪吃蛇网页游戏" />
+      <button id="btnSend">发送</button>
+      <button class="secondary hidden" id="btnCancel">取消</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label style="margin:0"><input type="checkbox" id="useSse" checked> 用 SSE 实时收进度</label>
+    </div>
+    <div class="status" id="chatStatus"></div>
+  </div>
+
+  <div class="card" id="appsCard">
+    <h2>Sealos 里的 demo 工作台（GET /apps）</h2>
+    <div class="apps" id="appsList">加载中…</div>
+  </div>
+</div>
+
+<script>
+let APP = null;
+let currentTaskId = null;
+const $ = (id) => document.getElementById(id);
+
+function step(id, cls, text) {
+  const el = $(id);
+  el.className = "step " + cls;
+  if (text) el.innerHTML = '<span class="dot"></span>' + text;
+}
+function addMsg(cls, html) {
+  const d = document.createElement("div");
+  d.className = "msg " + cls;
+  d.innerHTML = html;
+  $("chatLog").appendChild(d);
+  $("chatLog").scrollTop = $("chatLog").scrollHeight;
+  return d;
+}
+function esc(s) { return String(s || "").replace(/</g, "&lt;"); }
+
+async function loadApps() {
+  try {
+    const apps = await (await fetch("/api/apps")).json();
+    $("appsList").innerHTML = apps.length
+      ? apps.map(a => `${a.name} · ${a.status} · ${a.upTime || ""} <button class="secondary" onclick="delApp('${a.name}')">删除</button>`).join("<br>")
+      : "（无，点上方创建一个）";
+  } catch { $("appsList").textContent = "加载失败"; }
+}
+window.delApp = async (name) => {
+  if (!confirm("删除 " + name + "？PVC 数据不可恢复")) return;
+  await fetch("/api/app/" + name, { method: "DELETE" });
+  loadApps();
+};
+
+$("btnCreate").onclick = async () => {
+  $("btnCreate").disabled = true;
+  $("createErr").classList.add("hidden");
+  $("steps").classList.remove("hidden");
+  step("st1", "active");
+  try {
+    const d = await (await fetch("/api/create", { method: "POST", headers: {"Content-Type":"application/json"}, body: "{}" })).json();
+    if (!d.ok) throw new Error(d.error);
+    APP = d.name;
+    step("st1", "done", "调用 Sealos API 创建应用 · " + APP);
+    step("st2", "active");
+    for (let i = 0; i < 100; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      const s = await (await fetch("/api/app/" + APP)).json();
+      $("createMeta") && ($("appInfo").textContent = "status=" + s.status);
+      if (s.status === "running" && s.publicAddress) {
+        step("st2", "done", "拉取镜像 / 启动容器 · running（" + s.image + "）");
+        step("st3", "active");
+        let ok = false;
+        for (let j = 0; j < 20; j++) {
+          const h = await (await fetch("/api/health/" + APP)).json();
+          if (h.ok) { ok = true; break; }
+          await new Promise(r => setTimeout(r, 3000));
+        }
+        if (!ok) throw new Error("网关健康检查未通过");
+        step("st3", "done", "网关就绪 · " + s.publicAddress);
+        $("appInfo").textContent = "工作台地址：" + s.publicAddress + "（镜像 " + s.image + "）";
+        $("appInfo").classList.remove("hidden");
+        $("wsCard").classList.remove("hidden");
+        $("settingsCard").classList.remove("hidden");
+        $("chatCard").classList.remove("hidden");
+        $("wsMeta").textContent = s.publicAddress;
+        addMsg("bot", "工作台已就绪 ✅ 可在下方设置面板调整模型/权限/人设，然后派活给我。");
+        loadSettings();
+        loadApps();
+        break;
+      }
+      if (["Failed", "Stopped", "Cancelled"].includes(s.status)) throw new Error("Sealos 状态: " + s.status);
+    }
+  } catch (e) {
+    step("st2", "fail", "失败：" + (e.message || e));
+    $("createErr").textContent = String(e.message || e);
+    $("createErr").classList.remove("hidden");
+    $("btnCreate").disabled = false;
+  }
+};
+
+$("btnDeleteWs").onclick = async () => {
+  if (!confirm("删除工作台 " + APP + "？数据不可恢复")) return;
+  await fetch("/api/app/" + APP, { method: "DELETE" });
+  location.reload();
+};
+
+async function loadSettings() {
+  try {
+    const s = await (await fetch("/api/settings/" + APP)).json();
+    $("sModel").value = s.model || "";
+    $("sPerm").value = s.permissionMode || "workspace-write";
+    $("sReason").value = s.reasoning || "balanced";
+    $("sBg").value = s.background || "";
+    $("sMem").value = s.memory || "";
+  } catch {
+    $("settingsErr").textContent = "设置加载失败（工作台可能是旧版镜像，无 /settings 接口）";
+    $("settingsErr").classList.remove("hidden");
+  }
+}
+
+$("btnSaveSettings").onclick = async () => {
+  $("settingsErr").classList.add("hidden");
+  $("settingsOk").classList.add("hidden");
+  const body = {
+    model: $("sModel").value.trim(),
+    permissionMode: $("sPerm").value,
+    reasoning: $("sReason").value,
+    background: $("sBg").value,
+    memory: $("sMem").value,
+  };
+  const r = await fetch("/api/settings/" + APP, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body) });
+  const d = await r.json();
+  if (r.status !== 200) { $("settingsErr").textContent = d.error || "保存失败"; $("settingsErr").classList.remove("hidden"); return; }
+  $("settingsOk").textContent = "已保存 ✅（对下一个提交的任务生效）";
+  $("settingsOk").classList.remove("hidden");
+};
+$("btnResetSettings").onclick = async () => {
+  await fetch("/api/settings/" + APP, { method: "DELETE" });
+  loadSettings();
+  $("settingsOk").textContent = "已重置为默认";
+  $("settingsOk").classList.remove("hidden");
+};
+
+function finishChat(t) {
+  const evHtml = (t.events || []).slice(-8).map(e => "· " + esc(e.text)).join("<br>");
+  addMsg("bot", (t.reply ? esc(t.reply) : "⚠️ " + esc(t.error || "(无回复)")) + (evHtml ? '<div class="events">' + evHtml + "</div>" : ""));
+  $("btnSend").disabled = false;
+  $("btnCancel").classList.add("hidden");
+  $("chatStatus").textContent = "";
+}
+
+async function sendChat() {
+  const input = $("chatInput");
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  addMsg("user", esc(text));
+  $("btnSend").disabled = true;
+  $("btnCancel").classList.remove("hidden");
+  try {
+    const body = $("useSse").checked ? { message: text } : { message: text };
+    const c = await (await fetch("/api/chat/" + APP, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body) })).json();
+    if (!c.task_id) throw new Error(c.error || "提交失败");
+    currentTaskId = c.task_id;
+
+    if ($("useSse").checked) {
+      // SSE 实时流（demo 后端注入 gwToken）
+      const es = new EventSource("/api/stream/" + APP + "/" + c.task_id);
+      const evBuf = [];
+      es.addEventListener("log", (e) => {
+        evBuf.push(JSON.parse(e.data).text);
+        $("chatStatus").textContent = "执行中… 事件 " + evBuf.length + " 条";
+      });
+      es.addEventListener("done", (e) => {
+        es.close();
+        finishChat(JSON.parse(e.data));
+      });
+      es.onerror = () => { es.close(); };
+    } else {
+      for (let i = 0; i < 200; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        const t = await (await fetch("/api/task/" + APP + "/" + c.task_id)).json();
+        $("chatStatus").textContent = `执行中… ${t.status} · ${Math.round((t.elapsed_ms||0)/1000)}s · 事件 ${(t.events||[]).length} 条`;
+        if (["done", "failed", "timeout"].includes(t.status)) { finishChat(t); break; }
+      }
+    }
+  } catch (e) {
+    addMsg("bot", "⚠️ " + esc(e.message || e));
+    $("btnSend").disabled = false;
+    $("btnCancel").classList.add("hidden");
+  }
+}
+$("btnCancel").onclick = async () => {
+  if (currentTaskId) await fetch("/api/task/" + APP + "/" + currentTaskId, { method: "DELETE" });
+  $("chatStatus").textContent = "已请求取消";
+};
+$("btnSend").onclick = sendChat;
+$("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+
+async function loadConfig() {
+  try {
+    const c = await (await fetch("/api/config")).json();
+    const envNote = c.fromEnv ? "（来自 .env）" : "";
+    $("cfgStatus").innerHTML =
+      '<span class="cfgDot ' + (c.deepseekKey ? "on" : "off") + '"></span>Key ' + (c.deepseekKey ? c.deepseekKey : "未配置") +
+      ' &nbsp;<span class="cfgDot ' + (c.acrPassSet ? "on" : "off") + '"></span>ACR ' + (c.acrPassSet ? "已配置" : "未配置") + envNote;
+  } catch { $("cfgStatus").textContent = "配置状态加载失败"; }
+}
+$("btnSaveCfg").onclick = async () => {
+  const body = {};
+  if ($("cKey").value.trim()) body.deepseekKey = $("cKey").value.trim();
+  if ($("cAcrUser").value.trim()) body.acrUser = $("cAcrUser").value.trim();
+  if ($("cAcrPass").value) body.acrPass = $("cAcrPass").value;
+  if (!Object.keys(body).length) { $("cfgStatus").textContent = "请先填写要保存的配置项"; return; }
+  await fetch("/api/config", { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body) });
+  $("cKey").value = ""; $("cAcrPass").value = "";
+  loadConfig();
+};
+
+loadConfig();
+loadApps();
+</script>
+</body>
+</html>
