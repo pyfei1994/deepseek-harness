@@ -1,6 +1,6 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:1.2.0`（网关 `gateway/0.3`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
+> 适用版本：镜像 `eftik-dsh-cloud:1.3.0`（网关 `gateway/0.4`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
 > 更新时间：2026-09-06
 
 网关运行在每个用户的 DSH 工作台容器内，监听容器 `0.0.0.0:8090`，是业务后端（kitsume）操作工作台的唯一入口。业务方不直接接触 dsh CLI。
@@ -79,7 +79,31 @@ X-GW-Token: <gwToken>
 
 ## 3. 工作台设置
 
-工作台级设置，持久化在容器 `/workspace/.eftik-settings.json`（workspace PVC 上，容器重建不丢）。设置在**提交任务时**生效快照——进行中的任务不受影响。
+工作台级设置，持久化在容器 `GW_SETTINGS_PATH`（默认 `/home/node/.dsh/eftik-settings.json`，在 **dsh-home PVC** 上、workspace 之外，容器重建不丢）。设置在**提交任务时**生效快照——进行中的任务不受影响。
+
+### 产品模式（多租户上线必开）
+
+创建容器时注入环境变量 `GW_PRODUCT_MODE=1` 后，设置接口按「平台 / 用户」两级权限工作：
+
+| 环境变量 | 说明 |
+|----------|------|
+| `GW_PRODUCT_MODE=1` | 开启产品模式（不设则网关行为同 0.3，demo 用） |
+| `GW_ADMIN_TOKEN` | 平台管理令牌，请求头 `X-GW-Admin` 携带者视为平台（由 kitsume 后端持有，**与 gwToken 分开保管**） |
+| `GW_PRESET_BACKGROUND` / `GW_PRESET_MEMORY` | 平台预设角色背景/记忆（建议经 Sealos env `secretKeyRef` 注入），作为默认值，用户不可见不可改 |
+| `GW_WORKDIR` | dsh 执行工作目录，默认 `/workspace`（spawn cwd 锁定 + 系统前导声明） |
+| `GW_SETTINGS_PATH` | 设置文件路径，默认 `/home/node/.dsh/eftik-settings.json` |
+
+产品模式下的访问规则：
+
+| 字段 | 用户（仅 X-GW-Token） | 平台（额外 X-GW-Admin） |
+|------|----------------------|------------------------|
+| `model` / `provider` / `reasoning` | 可改 | 可改 |
+| `permissionMode` | **锁定为部署值**（`DSH_PERMISSION_MODE`，默认 workspace-write），改 `danger-full-access` 会被静默忽略 | 可改 |
+| `background` / `memory` | **GET 不返回、POST 修改被忽略** | 可读可写 |
+
+配合 `permissionMode=workspace-write`（dsh 官方沙箱：只允许写工作区）+ spawn `cwd=/workspace` + 设置文件移出 workspace，实现：**用户只能在 workspace 内办公，且看不到、改不了平台预设的角色与记忆**。
+
+> 说明：任务前导 `<system-context>` 会注入保密指令（禁止模型复述系统设定），但大模型没有 100% 防社工泄露的保证；预设中不要放敏感凭据，敏感数据只走平台侧。
 
 ### 设置字段
 
@@ -87,24 +111,28 @@ X-GW-Token: <gwToken>
 |------|------|--------|------|
 | `model` | string | `""`（内核默认 `deepseek-v4-flash`） | 大模型名称，如 `deepseek-v4-flash`。通过 `--patch` 覆盖内核 `agent-default-model` 插件 |
 | `provider` | string | `""`（即 `deepseek-official`） | 模型提供方，一般不填 |
-| `permissionMode` | enum | `workspace-write` | 权限档位（官方原生预设，sandbox + 审批策略联动）：<br>`read-only` 只读沙箱，不可写文件不可执行写操作<br>`workspace-write` 可读写工作区、执行命令（默认）<br>`danger-full-access` 全权访问 + 免审批自动执行（建议 VIP 专属或加扣积分） |
+| `permissionMode` | enum | `workspace-write` | 权限档位（官方原生预设，sandbox + 审批策略联动）：<br>`read-only` 只读沙箱，不可写文件不可执行写操作<br>`workspace-write` 可读写工作区、执行命令（默认）<br>`danger-full-access` 全权访问 + 免审批自动执行（产品模式下用户锁定，不可选） |
 | `reasoning` | enum | `balanced` | 推理等级 `low` / `balanced` / `high`。注：内核 0.1.2-rc.1 无原生推理等级配置，当前以系统前导指令模拟，上游支持后切换为真实配置 |
-| `background` | string ≤32KB | `""` | 角色背景/人设，每次任务前注入 `<system-context>` |
-| `memory` | string ≤32KB | `""` | 长期记忆（事实、偏好），注入方式同上 |
+| `background` | string ≤32KB | `""`（可由 `GW_PRESET_BACKGROUND` 预设） | 角色背景/人设，每次任务前注入 `<system-context>`。产品模式仅平台可读写 |
+| `memory` | string ≤32KB | `""`（可由 `GW_PRESET_MEMORY` 预设） | 长期记忆（事实、偏好），注入方式同上。产品模式仅平台可读写 |
 
 ### GET /settings
 
-读取当前设置，返回上述字段的完整 JSON。
+读取当前设置。
+
+- 非产品模式 / 平台请求：返回全部字段
+- 产品模式 + 用户请求：不返回 `background`/`memory`，附加 `permissionModeLocked: true`、`presetLocked: true`
 
 ### POST /settings
 
-部分更新（只传要改的字段），服务端合并后持久化，返回更新后的完整设置。
+部分更新（只传要改的字段），服务端合并后持久化，返回更新后的设置（用户视角已脱敏）。
 
 **请求示例**
 
 ```bash
 curl -X POST https://<工作台地址>/settings \
   -H "X-GW-Token: <gwToken>" \
+  -H "X-GW-Admin: <adminToken>" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-v4-flash",
@@ -123,7 +151,7 @@ curl -X POST https://<工作台地址>/settings \
 
 ### DELETE /settings
 
-重置为默认值，返回重置后的设置。
+重置为默认值（平台 env 预设保留），返回重置后的设置。
 
 ---
 
@@ -237,3 +265,4 @@ data: {"status":"done","reply":"...","error":"","elapsed_ms":15230}
 | gateway/0.1 | 1.0.0 | 首版：chat/task/health，X-GW-Token 鉴权，串行队列 |
 | gateway/0.2 | 1.1.0 | `history` 会话历史入参；SSE 实时流；health 带版本号 |
 | gateway/0.3 | 1.2.0 | `/settings` 三接口：模型切换（--patch agent-default-model）、permissionMode 官方三档、reasoning 模拟档位、background/memory 人设记忆（PVC 持久化） |
+| gateway/0.4 | 1.3.0 | 产品模式 `GW_PRODUCT_MODE`：permissionMode 锁定部署值、background/memory 仅平台（X-GW-Admin）可读写、env 预设注入；设置文件移出 workspace（/home/node/.dsh/，含旧路径自动迁移）；spawn cwd 锁定 /workspace；系统前导注入保密指令与工作目录约定 |
