@@ -21,8 +21,8 @@
   button.secondary:hover { background: #3a3a3a; }
   button.danger { background: #7f1d1d; }
   button.danger:hover { background: #991b1b; }
-  input[type=text], select, textarea { background: #141414; border: 1px solid #333; color: #e8e6e3; border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit; }
-  input[type=text] { flex: 1; min-width: 200px; }
+  input[type=text], input[type=password], select, textarea { background: #141414; border: 1px solid #333; color: #e8e6e3; border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit; }
+  input[type=text], input[type=password] { flex: 1; min-width: 200px; }
   textarea { width: 100%; resize: vertical; }
   input:focus, select:focus, textarea:focus { outline: none; border-color: #2563eb; }
   label { font-size: 12px; color: #9a968f; display: block; margin: 10px 0 4px; }
@@ -57,6 +57,27 @@
 <div class="wrap">
   <h1>狐分身 · DSH 工作台 Demo</h1>
   <div class="sub">镜像 eftik-dsh-cloud:1.2.0（网关 v0.3）· Sealos 一键创建 · 全接口演示</div>
+
+  <div class="card">
+    <h2>密钥配置（仅存本服务内存，刷新/重启即失，不落盘不提交）</h2>
+    <div class="grid">
+      <div>
+        <label>DeepSeek API Key</label>
+        <input type="password" id="cKey" placeholder="sk-..." autocomplete="off">
+      </div>
+      <div>
+        <label>ACR 用户名 / 密码（阿里云容器镜像仓库）</label>
+        <div class="row" style="flex-wrap:nowrap">
+          <input type="text" id="cAcrUser" placeholder="eftik" style="flex:0 0 110px;min-width:0" autocomplete="off">
+          <input type="password" id="cAcrPass" placeholder="密码" autocomplete="off">
+        </div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnSaveCfg">保存到本会话</button>
+      <span class="meta" id="cfgStatus"></span>
+    </div>
+  </div>
 
   <div class="card">
     <div class="row">
