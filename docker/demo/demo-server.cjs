@@ -25,8 +25,11 @@ try {
 
 const PORT = Number(process.env.DEMO_PORT || 8093);
 const SEALOS_API = "https://applaunchpad.hzh.sealos.run/api/v2alpha";
-const KUBECONFIG_PATH = process.env.SEALOS_KUBECONFIG_PATH || "C:/Users/vante/Downloads/kubeconfig (5).yaml";
-const AUTH = encodeURIComponent(fs.readFileSync(KUBECONFIG_PATH, "utf8"));
+const KUBECONFIG_PATH = process.env.SEALOS_KUBECONFIG_PATH
+  || (fs.existsSync(path.join(__dirname, "kubeconfig.yaml")) ? path.join(__dirname, "kubeconfig.yaml") : "")
+  || "C:/Users/vante/Downloads/kubeconfig (5).yaml";
+const KUBECONFIG_ABS = path.isAbsolute(KUBECONFIG_PATH) ? KUBECONFIG_PATH : path.join(__dirname, KUBECONFIG_PATH);
+const AUTH = encodeURIComponent(fs.readFileSync(KUBECONFIG_ABS, "utf8"));
 const IMAGE = process.env.DSH_IMAGE || "registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:1.2.0";
 const CPU = Number(process.env.DSH_CPU || 1);
 const MEM = Number(process.env.DSH_MEM || 2);

@@ -32,4 +32,5 @@ node demo-server.cjs
 - `demo-server.cjs`：静态页 + Sealos/网关代理（gwToken 只在服务端注入，浏览器接触不到）
 - `demo.html`：单页 UI（含密钥配置面板）
 - `.env.example`：密钥配置模板（真实 `.env` 已 gitignore）
+- `kubeconfig.yaml`：Sealos 集群凭据（**含敏感凭据，已 gitignore，勿提交**）
 - `workspaces.local.json`：运行时生成的工作台注册表（含 gwToken，**已 gitignore，勿提交**）
