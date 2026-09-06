@@ -45,6 +45,8 @@ DeepSeek API Key 与 ACR 用户名/密码两种方式配置，任选其一：
 | SSE 实时进度 | GET /api/stream/:name/:tid | GET /task/:id/stream | - |
 | 结果轮询（可选关闭 SSE） | GET /api/task/:name/:tid | GET /task/:id | - |
 | 取消任务 | DELETE /api/task/:name/:tid | DELETE /task/:id | - |
+| 工作区文件浏览 | GET /api/files/:name | GET /files?path= | - |
+| 文件下载 | GET /api/download/:name | GET /files/download?path= | - |
 | 删除工作台 | DELETE /api/app/:name | - | DELETE /apps/{name} |
 | 工作台列表 | GET /api/apps | - | GET /apps |
 

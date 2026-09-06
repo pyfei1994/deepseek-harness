@@ -1,6 +1,6 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:1.3.0`（网关 `gateway/0.4`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
+> 适用版本：镜像 `eftik-dsh-cloud:1.4.0`（网关 `gateway/0.5`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
 > 更新时间：2026-09-06
 
 网关运行在每个用户的 DSH 工作台容器内，监听容器 `0.0.0.0:8090`，是业务后端（kitsume）操作工作台的唯一入口。业务方不直接接触 dsh CLI。
@@ -236,7 +236,47 @@ data: {"status":"done","reply":"...","error":"","elapsed_ms":15230}
 
 ---
 
-## 5. 业务后端对接流程（kitsume）
+## 5. 工作区文件
+
+浏览与下载 `/workspace` 内的文件（网关直接读 PVC，不经过 dsh）。**路径安全**：仅限 workspace
+内部——posix normalize 把 `..` 消解在虚拟根内 + `startsWith` 校验 + realpath 二次校验防符号
+链接逃逸；单文件下载上限默认 200MB（`GW_MAX_DOWNLOAD_MB` 可调）。
+
+### GET /files?path=/{dir}
+
+列出目录内容。
+
+**返回（200）**
+
+```json
+{
+  "path": "/",
+  "entries": [
+    { "name": "sub", "type": "dir", "size": 0, "mtime": 1788671820398 },
+    { "name": "hello.txt", "type": "file", "size": 12, "mtime": 1788671820376 }
+  ]
+}
+```
+
+- `path` 不传默认根目录 `/`；目录优先排序，同名按名称排序
+- 错误：400（路径越界 / 目标不是目录）、404（路径不存在）、401（token 错误）
+
+### GET /files/download?path=/{file}
+
+下载文件，`application/octet-stream` 流式响应，带 `Content-Length` 与 RFC 5987 编码的
+`Content-Disposition`（支持中文文件名）。
+
+```bash
+curl -O -J -H "X-GW-Token: <gwToken>" "https://<工作台地址>/files/download?path=/hello.txt"
+```
+
+- 错误：400（路径越界 / 目标是目录 / 超过大小上限）、404（文件不存在）
+
+> 上传接口暂未提供（M2 按需设计：multipart + 配额校验）。
+
+---
+
+## 6. 业务后端对接流程（kitsume）
 
 ```
 1. 用户点"创建工作台"
@@ -258,7 +298,7 @@ data: {"status":"done","reply":"...","error":"","elapsed_ms":15230}
 
 ---
 
-## 6. 版本记录
+## 7. 版本记录
 
 | 网关版本 | 镜像 tag | 变更 |
 |----------|----------|------|
@@ -266,3 +306,4 @@ data: {"status":"done","reply":"...","error":"","elapsed_ms":15230}
 | gateway/0.2 | 1.1.0 | `history` 会话历史入参；SSE 实时流；health 带版本号 |
 | gateway/0.3 | 1.2.0 | `/settings` 三接口：模型切换（--patch agent-default-model）、permissionMode 官方三档、reasoning 模拟档位、background/memory 人设记忆（PVC 持久化） |
 | gateway/0.4 | 1.3.0 | 产品模式 `GW_PRODUCT_MODE`：permissionMode 锁定部署值、background/memory 仅平台（X-GW-Admin）可读写、env 预设注入；设置文件移出 workspace（/home/node/.dsh/，含旧路径自动迁移）；spawn cwd 锁定 /workspace；系统前导注入保密指令与工作目录约定 |
+| gateway/0.5 | 1.4.0 | 工作区文件接口：GET /files 目录列表、GET /files/download 流式下载（防穿越/防符号链接逃逸，下载上限 `GW_MAX_DOWNLOAD_MB` 默认 200MB） |

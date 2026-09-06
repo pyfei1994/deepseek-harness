@@ -46,7 +46,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/0.4";
+const GATEWAY_VERSION = "gateway/0.5";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -57,6 +57,7 @@ const LEGACY_SETTINGS_PATH = "/workspace/.eftik-settings.json";
 const TIMEOUT_MS = Number(process.env.DSH_TIMEOUT_MS || 600000);
 const MAX_EVENTS = 200;
 const MAX_HISTORY = 20;
+const MAX_DOWNLOAD_BYTES = Number(process.env.GW_MAX_DOWNLOAD_MB || 200) * 1024 * 1024;
 const PERMISSION_MODES = ["read-only", "workspace-write", "danger-full-access"];
 const REASONING_LEVELS = ["low", "balanced", "high"];
 const MAX_TEXT = 32768;
@@ -129,6 +130,58 @@ function validateSettings(patch) {
     if (patch[k] !== undefined && (typeof patch[k] !== "string" || patch[k].length > MAX_TEXT)) errors.push(`${k} 须为 ≤${MAX_TEXT} 字符字符串`);
   }
   return errors;
+}
+
+/* ---------- 工作区文件（仅限 WORKDIR 内，防目录穿越/符号链接逃逸） ---------- */
+
+function safeResolve(rel) {
+  const norm = path.posix.normalize("/" + String(rel || "/").replace(/\\/g, "/"));
+  const abs = path.resolve(WORKDIR, "." + norm);
+  const root = path.resolve(WORKDIR);
+  if (abs !== root && !abs.startsWith(root + path.sep)) return null;
+  return abs;
+}
+
+function safeStat(abs) {
+  // realpath 二次校验，防止符号链接指到 workspace 外
+  const st = fs.statSync(abs);
+  const real = fs.realpathSync(abs);
+  let realRoot = path.resolve(WORKDIR);
+  try { realRoot = fs.realpathSync(realRoot); } catch {}
+  if (!real.startsWith(realRoot)) return null;
+  return st;
+}
+
+function listFiles(rel) {
+  const abs = safeResolve(rel);
+  if (!abs) return { code: 400, body: { error: "路径越界，仅限 workspace 内" } };
+  let st;
+  try { st = safeStat(abs); } catch { return { code: 404, body: { error: "路径不存在" } }; }
+  if (!st) return { code: 400, body: { error: "路径越界，仅限 workspace 内" } };
+  if (!st.isDirectory()) return { code: 400, body: { error: "目标不是目录" } };
+  const entries = fs.readdirSync(abs, { withFileTypes: true }).map((e) => {
+    let type = e.isDirectory() ? "dir" : e.isSymbolicLink() ? "file" : "file";
+    let size = 0, mtime = 0;
+    try {
+      const s = fs.statSync(path.join(abs, e.name));
+      size = s.size; mtime = s.mtimeMs;
+      if (e.isSymbolicLink()) type = s.isDirectory() ? "dir" : "file";
+    } catch {}
+    return { name: e.name, type, size, mtime: Math.round(mtime) };
+  }).sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1));
+  return { code: 200, body: { path: path.posix.normalize("/" + String(rel || "/").replace(/\\/g, "/")), entries } };
+}
+
+/** 下载：返回 {stream, size, filename} 或错误对象 */
+function openDownload(rel) {
+  const abs = safeResolve(rel);
+  if (!abs) return { error: "路径越界，仅限 workspace 内", code: 400 };
+  let st;
+  try { st = safeStat(abs); } catch { return { error: "文件不存在", code: 404 }; }
+  if (!st) return { error: "路径越界，仅限 workspace 内", code: 400 };
+  if (!st.isFile()) return { error: "仅支持下载文件", code: 400 };
+  if (st.size > MAX_DOWNLOAD_BYTES) return { error: `文件超过下载上限（${Math.round(MAX_DOWNLOAD_BYTES / 1024 / 1024)}MB）`, code: 400 };
+  return { stream: fs.createReadStream(abs), size: st.size, filename: path.basename(abs) };
 }
 
 /* ---------- 任务组装 ---------- */
@@ -300,6 +353,25 @@ const server = http.createServer(async (req, res) => {
       const admin = isAdmin(req);
       saveSettings({ ...DEFAULT_SETTINGS }); // 重置保留平台 env 预设
       return send(res, 200, viewSettings({ ...DEFAULT_SETTINGS }, admin));
+    }
+
+    /* ---------- 工作区文件 ---------- */
+    if (req.method === "GET" && url.pathname === "/files") {
+      const r = listFiles(url.searchParams.get("path"));
+      return send(res, r.code, r.body);
+    }
+    if (req.method === "GET" && url.pathname === "/files/download") {
+      const r = openDownload(url.searchParams.get("path"));
+      if (r.error) return send(res, r.code, { error: r.error });
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": r.size,
+        "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(r.filename)}`,
+        "Cache-Control": "no-store",
+      });
+      r.stream.pipe(res);
+      r.stream.on("error", () => res.destroy());
+      return;
     }
 
     /* ---------- 任务 ---------- */

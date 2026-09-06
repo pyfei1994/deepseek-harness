@@ -152,6 +152,15 @@
     <div class="status" id="chatStatus"></div>
   </div>
 
+  <div class="card hidden" id="filesCard">
+    <h2>工作区文件（GET /files · 下载）</h2>
+    <div class="row">
+      <input type="text" id="filesPath" value="/" placeholder="/path/to/dir">
+      <button class="secondary" id="btnFilesReload">刷新</button>
+    </div>
+    <div class="apps" id="filesList" style="margin-top:10px">加载中…</div>
+  </div>
+
   <div class="card" id="appsCard">
     <h2>Sealos 里的 demo 工作台（GET /apps）</h2>
     <div class="apps" id="appsList">加载中…</div>
@@ -223,9 +232,11 @@ $("btnCreate").onclick = async () => {
         $("wsCard").classList.remove("hidden");
         $("settingsCard").classList.remove("hidden");
         $("chatCard").classList.remove("hidden");
+        $("filesCard").classList.remove("hidden");
         $("wsMeta").textContent = s.publicAddress;
         addMsg("bot", "工作台已就绪 ✅ 可在下方设置面板调整模型/权限/人设，然后派活给我。");
         loadSettings();
+        loadFiles();
         loadApps();
         break;
       }
@@ -357,6 +368,36 @@ $("btnSaveCfg").onclick = async () => {
   $("cKey").value = ""; $("cAcrPass").value = "";
   loadConfig();
 };
+
+let filesDir = "/";
+function fmtSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + " KB";
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
+  return (n / 1073741824).toFixed(2) + " GB";
+}
+function parentDir(p) { const parts = p.split("/").filter(Boolean); parts.pop(); return "/" + parts.join("/"); }
+window.parentDir = parentDir;
+window.navFiles = (p) => { filesDir = p; loadFiles(); };
+async function loadFiles() {
+  if (!APP) return;
+  try {
+    const d = await (await fetch("/api/files/" + APP + "?path=" + encodeURIComponent(filesDir))).json();
+    if (d.error) { $("filesList").textContent = d.error; return; }
+    filesDir = d.path;
+    $("filesPath").value = d.path;
+    const base = d.path === "/" ? "" : d.path;
+    let rows = base ? `<a href="#" onclick="navFiles(decodeURIComponent('${encodeURIComponent(parentDir(d.path))}'));return false">📁 ..（上级）</a><br>` : "";
+    rows += d.entries.map((e) => {
+      const fp = base + "/" + e.name;
+      return e.type === "dir"
+        ? `📁 <a href="#" onclick="navFiles(decodeURIComponent('${encodeURIComponent(fp)}'));return false">${esc(e.name)}</a>`
+        : `📄 ${esc(e.name)} <span class="meta">· ${fmtSize(e.size)}</span> <a class="meta" href="/api/download/${APP}?path=${encodeURIComponent(fp)}">下载</a>`;
+    }).join("<br>");
+    $("filesList").innerHTML = rows || "（空目录）";
+  } catch { $("filesList").textContent = "加载失败"; }
+}
+$("btnFilesReload").onclick = () => { filesDir = $("filesPath").value.trim() || "/"; loadFiles(); };
 
 loadConfig();
 loadApps();

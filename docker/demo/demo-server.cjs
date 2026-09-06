@@ -273,6 +273,32 @@ const server = http.createServer(async (req, res) => {
       return send(res, r.status, await r.json());
     }
 
+    /* ---------- 工作区文件（网关 v0.5） ---------- */
+    m = url.pathname.match(/^\/api\/files\/([\w-]+)$/);
+    if (req.method === "GET" && m) {
+      const ws = getWs(m[1]);
+      if (!ws) return send(res, 400, { error: "工作台不存在或未就绪" });
+      const r = await gwFetch(ws, `/files?path=${encodeURIComponent(url.searchParams.get("path") || "/")}`);
+      return send(res, r.status, await r.json());
+    }
+    m = url.pathname.match(/^\/api\/download\/([\w-]+)$/);
+    if (req.method === "GET" && m) {
+      const ws = getWs(m[1]);
+      if (!ws) { res.writeHead(400); return res.end("workspace not ready"); }
+      const upstream = await gwFetch(ws, `/files/download?path=${encodeURIComponent(url.searchParams.get("path") || "")}`);
+      if (upstream.status !== 200) return send(res, upstream.status, await upstream.json().catch(() => ({ error: "download failed" })));
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": upstream.headers.get("content-length") || undefined,
+        "Content-Disposition": upstream.headers.get("content-disposition") || "attachment",
+        "Cache-Control": "no-store",
+      });
+      const reader = upstream.body.getReader();
+      try { for (;;) { const { done, value } = await reader.read(); if (done) break; res.write(Buffer.from(value)); } } catch {}
+      res.end();
+      return;
+    }
+
     /* ---------- 静态页 ---------- */
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
       const html = fs.readFileSync(path.join(__dirname, "demo.html"));
