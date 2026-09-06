@@ -56,7 +56,7 @@
 <body>
 <div class="wrap">
   <h1>狐分身 · DSH 工作台 Demo</h1>
-  <div class="sub">镜像 eftik-dsh-cloud:0.5.0（网关 v0.5 · 产品模式 · 工作区文件接口）· Sealos 一键创建 · 全接口演示</div>
+  <div class="sub">镜像 eftik-dsh-cloud:0.6.0（网关 v0.6 · 产品模式 · 文件接口 · token 消耗）· Sealos 一键创建 · 全接口演示</div>
 
   <div class="card">
     <h2>密钥配置（仅存本服务内存，刷新/重启即失，不落盘不提交）</h2>
@@ -295,7 +295,11 @@ $("btnResetSettings").onclick = async () => {
 
 function finishChat(t) {
   const evHtml = (t.events || []).slice(-8).map(e => "· " + esc(e.text)).join("<br>");
-  addMsg("bot", (t.reply ? esc(t.reply) : "⚠️ " + esc(t.error || "(无回复)")) + (evHtml ? '<div class="events">' + evHtml + "</div>" : ""));
+  const u = t.usage;
+  const usageHtml = u && u.calls
+    ? '<div class="events">🎟 token · 输入 ' + u.inputTokens + "（缓存命中 " + u.cacheReadTokens + "）· 输出 " + u.outputTokens + " · 共 " + u.totalTokens + " · " + u.calls + " 次调用</div>"
+    : "";
+  addMsg("bot", (t.reply ? esc(t.reply) : "⚠️ " + esc(t.error || "(无回复)")) + (evHtml ? '<div class="events">' + evHtml + "</div>" : "") + usageHtml);
   $("btnSend").disabled = false;
   $("btnCancel").classList.add("hidden");
   $("chatStatus").textContent = "";

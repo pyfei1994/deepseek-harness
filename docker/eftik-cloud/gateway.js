@@ -6,8 +6,10 @@
  * 任务接口：
  *   POST /chat            {"task": "..."} 或 {"message": "...", "history": [{role, content}]}
  *                         -> {"task_id"}
- *   GET  /task/:id        -> {"status","reply","error","events","elapsed_ms"}
- *   GET  /task/:id/stream SSE 实时流：event: log / event: done
+ *   GET  /task/:id        -> {"status","reply","error","events","elapsed_ms",
+ *                            "usage":{calls,inputTokens,outputTokens,totalTokens,
+ *                            cacheReadTokens,cacheWriteTokens,reasoningTokens}|null}
+ *   GET  /task/:id/stream SSE 实时流：event: log / event: done（done 携带 usage）
  *   DELETE /task/:id      取消任务
  *
  * 设置接口（持久化到 GW_SETTINGS_PATH，默认 /home/node/.dsh/eftik-settings.json，
@@ -51,7 +53,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/0.5";
+const GATEWAY_VERSION = "gateway/0.6";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -237,13 +239,27 @@ function runDsh(job) {
     // 权限模式：官方环境变量开关（sandbox-policy + approval 联动）
     if (job.settings.permissionMode) spawnEnv.DSH_PERMISSION_MODE = job.settings.permissionMode;
 
-    // 模型切换：写 patch 覆盖 agent-default-model 插件
+    // --patch：模型切换（可选，覆盖已有 agent-default-model 行）+ usage-probe 外挂插件
+    // （新插件必须走 insert 块——patch 普通行只覆盖已存在的 id，匹配不到会静默跳过）。
+    // 插件监听 assistant/message 的 usage（provider 精确值）任务级累加写盘，
+    // 任务结束时网关读取 → /task/:id 返回给业务方计费；零 dsh 内核改动。
+    const usageFile = `/tmp/dsh-usage-${job.id}.json`;
+    job.usageFile = usageFile;
+    const patchLines = [];
     if (job.settings.model) {
-      const patchPath = `/tmp/patch-${job.id}.yml`;
       const provider = job.settings.provider || "deepseek-official";
-      fs.writeFileSync(patchPath, `- id: agent-default-model\n  config:\n    provider: '${provider}'\n    model: '${job.settings.model}'\n`);
-      args.push("--patch", patchPath);
+      patchLines.push(`- id: agent-default-model\n  config:\n    provider: '${provider}'\n    model: '${job.settings.model}'\n`);
     }
+    patchLines.push(
+      "- insert:\n" +
+      "    - id: usage-probe\n" +
+      "      name: 'file:///opt/gw/usage-probe.js'\n" +
+      "      config:\n" +
+      `        outputFile: '${usageFile}'\n`
+    );
+    const patchPath = `/tmp/patch-${job.id}.yml`;
+    fs.writeFileSync(patchPath, patchLines.join(""));
+    args.push("--patch", patchPath);
 
     args.push(job.task);
     // 锁死执行目录：用户任务只允许在 workspace 内办公
@@ -274,7 +290,15 @@ function runDsh(job) {
     child.on("close", (code) => {
       clearTimeout(timer);
       job.finishedAt = Date.now();
-      if (job.settings.model) { try { fs.unlinkSync(`/tmp/patch-${job.id}.yml`); } catch {} }
+      // 读取 usage-probe 插件落盘的任务级 token 消耗（read-then-delete）
+      if (job.usageFile) {
+        try {
+          const raw = fs.readFileSync(job.usageFile, "utf8");
+          if (raw) job.usage = JSON.parse(raw);
+        } catch {}
+        try { fs.unlinkSync(job.usageFile); } catch {}
+      }
+      if (job.status !== "timeout") { try { fs.unlinkSync(`/tmp/patch-${job.id}.yml`); } catch {} }
       if (job.status === "timeout") {
         job.error = `dsh 超时（${TIMEOUT_MS / 1000}s）`;
       } else if (code === 0) {
@@ -329,7 +353,7 @@ function streamTask(req, res, job) {
     }
     if (["done", "failed", "timeout"].includes(job.status)) {
       clearInterval(timer);
-      res.write(`event: done\ndata: ${JSON.stringify({ status: job.status, reply: job.reply, error: job.error, elapsed_ms: (job.finishedAt || Date.now()) - job.createdAt })}\n\n`);
+      res.write(`event: done\ndata: ${JSON.stringify({ status: job.status, reply: job.reply, error: job.error, elapsed_ms: (job.finishedAt || Date.now()) - job.createdAt, usage: job.usage || null })}\n\n`);
       res.end();
     }
   }, 500);
@@ -415,6 +439,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         status: job.status, reply: job.reply, error: job.error,
         events: job.events, elapsed_ms: (job.finishedAt || Date.now()) - job.createdAt,
+        usage: job.usage || null,
       });
     }
 

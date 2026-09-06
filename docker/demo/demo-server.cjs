@@ -33,8 +33,8 @@ const KUBECONFIG_PATH = process.env.SEALOS_KUBECONFIG_PATH
   || (fs.existsSync(path.join(__dirname, "kubeconfig.yaml")) ? path.join(__dirname, "kubeconfig.yaml") : "");
 const KUBECONFIG_ABS = path.isAbsolute(KUBECONFIG_PATH) ? KUBECONFIG_PATH : path.join(__dirname, KUBECONFIG_PATH);
 const AUTH = encodeURIComponent(fs.readFileSync(KUBECONFIG_ABS, "utf8"));
-// 镜像 tag 与网关版本对齐：0.5.0 = 网关 v0.5；镜像自身修订走第三位（0.5.1...）
-const IMAGE = process.env.DSH_IMAGE || "registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:0.5.0";
+// 镜像 tag 与网关版本对齐：0.6.0 = 网关 v0.6；镜像自身修订走第三位（0.6.1...）
+const IMAGE = process.env.DSH_IMAGE || "registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:0.6.0";
 const CPU = Number(process.env.DSH_CPU || 1);
 const MEM = Number(process.env.DSH_MEM || 2);
 

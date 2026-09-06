@@ -1,6 +1,6 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:0.5.0`（网关 `gateway/0.5`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
+> 适用版本：镜像 `eftik-dsh-cloud:0.6.0`（网关 `gateway/0.6`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
 >
 > 镜像 tag 自 0.5.0 起与网关版本对齐（0.5.0 = 网关 v0.5）；镜像自身修订从第三位递增（0.5.1、0.5.2…），网关升版则前两位跟随
 > 更新时间：2026-09-06
@@ -204,7 +204,9 @@ curl -X POST https://<工作台地址>/settings \
     { "t": 1788620083000, "text": "dsh: reasoning:" },
     { "t": 1788620083500, "text": "The user wants me to create a script..." }
   ],
-  "elapsed_ms": 15230
+  "elapsed_ms": 15230,
+  "usage": {"calls":3,"inputTokens":812,"outputTokens":460,"totalTokens":1272,
+            "cacheReadTokens":512,"cacheWriteTokens":300,"reasoningTokens":120}
 }
 ```
 
@@ -215,6 +217,7 @@ curl -X POST https://<工作台地址>/settings \
 | `error` | 失败原因（failed/timeout 时有值） |
 | `events` | 执行过程日志行（思考/工具调用，最多 200 条），可展示为"分身正在干活"动态 |
 | `elapsed_ms` | 耗时（运行中为已耗时） |
+| `usage` | 任务级 token 消耗汇总（运行中/未采集为 `null`）。字段为 provider 精确上报值：`inputTokens` 未命中缓存输入、`outputTokens` 输出（含 reasoning）、`cacheReadTokens` 缓存命中（单价约为普通输入 1/10，计费建议三段分开）、`cacheWriteTokens` 缓存写入、`totalTokens` 官方总计、`calls` LLM 调用次数 |
 
 ### GET /task/{task_id}/stream
 
@@ -225,7 +228,7 @@ event: log
 data: {"t":1788620083000,"text":"dsh: reasoning:"}
 
 event: done
-data: {"status":"done","reply":"...","error":"","elapsed_ms":15230}
+data: {"status":"done","reply":"...","error":"","elapsed_ms":15230,"usage":{...}}
 ```
 
 - `log` 事件增量推送执行进度（500ms 批量刷新）
@@ -309,3 +312,4 @@ curl -O -J -H "X-GW-Token: <gwToken>" "https://<工作台地址>/files/download?
 | gateway/0.3 | 1.2.0 | `/settings` 三接口：模型切换（--patch agent-default-model）、permissionMode 官方三档、reasoning 模拟档位、background/memory 人设记忆（PVC 持久化） |
 | gateway/0.4 | 1.3.0 | 产品模式 `GW_PRODUCT_MODE`：permissionMode 锁定部署值、background/memory 仅平台（X-GW-Admin）可读写、env 预设注入；设置文件移出 workspace（/home/node/.dsh/，含旧路径自动迁移）；spawn cwd 锁定 /workspace；系统前导注入保密指令与工作目录约定 |
 | gateway/0.5 | 0.5.0 | 工作区文件接口：GET /files 目录列表、GET /files/download 流式下载（防穿越/防符号链接逃逸，下载上限 `GW_MAX_DOWNLOAD_MB` 默认 200MB） |
+| gateway/0.6 | 0.6.0 | 任务级 token 消耗：/task 与 SSE done 新增 `usage` 字段。经外挂插件 usage-probe（--patch 注入，零内核改动）监听 assistant/message 的 provider 精确 usage 累加落盘，网关读取后随任务返回 |
