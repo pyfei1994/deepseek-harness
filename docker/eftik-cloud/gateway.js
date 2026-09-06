@@ -234,7 +234,12 @@ function composeTask(body, settings) {
 function runDsh(job) {
   return new Promise((resolve) => {
     const args = ["--profile", "headless"];
-    const spawnEnv = { ...process.env, DSH_TELEMETRY_DISABLED: "1" };
+    // 子进程 env 安全剥离：agent bash 里 `env` 可见全部环境变量，
+    // GW_ADMIN_TOKEN/GW_TOKEN 是网关入站鉴权凭据，dsh 内核与插件都不需要——
+    // 不剥离的话 prompt-injection 诱导 agent 执行 `env` 即可窃取平台令牌。
+    // （DEEPSEEK_API_KEY 必须保留，dsh 调模型要用）
+    const { GW_ADMIN_TOKEN: _admin, GW_TOKEN: _tok, ...dshEnv } = process.env;
+    const spawnEnv = { ...dshEnv, DSH_TELEMETRY_DISABLED: "1" };
 
     // 权限模式：官方环境变量开关（sandbox-policy + approval 联动）
     if (job.settings.permissionMode) spawnEnv.DSH_PERMISSION_MODE = job.settings.permissionMode;
