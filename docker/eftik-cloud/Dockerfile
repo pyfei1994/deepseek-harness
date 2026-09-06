@@ -1,7 +1,8 @@
 # 狐分身 DSH 工作台 · 精简自研镜像（无浏览器/无 noVNC/无 Web UI 依赖）
 # 直接安装官方 @deepseek-ai/dsh npm 包，不依赖 runzhliu 社区镜像。
 # 面向 API/headless 场景：容器内只跑 in-pod 网关。
-# 构建：docker build -f docker/eftik-cloud/Dockerfile -t registry.cn-shanghai.aliyuncs.com/eftik-dsh-cloud:1.0.0 .
+# 构建（context 必须是本目录，COPY 才能找到 gateway.js）：
+# docker build -f docker/eftik-cloud/Dockerfile -t registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:0.5.0 docker/eftik-cloud
 
 FROM node:24-trixie
 

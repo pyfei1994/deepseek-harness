@@ -10,7 +10,7 @@ node demo-server.cjs
 # 打开 http://127.0.0.1:8093
 ```
 
-环境变量：`DEMO_PORT` / `SEALOS_KUBECONFIG_PATH` / `DSH_IMAGE`（默认 eftik-dsh-cloud:1.3.0）/ `DSH_CPU` / `DSH_MEM`，产品模式见下文
+环境变量：`DEMO_PORT` / `SEALOS_KUBECONFIG_PATH` / `DSH_IMAGE`（默认 eftik-dsh-cloud:0.5.0）/ `DSH_CPU` / `DSH_MEM`，产品模式见下文
 
 ## 密钥配置（代码零硬编码）
 
@@ -24,11 +24,11 @@ DeepSeek API Key 与 ACR 用户名/密码两种方式配置，任选其一：
 未配置密钥时点「一键创建工作台」会返回 400 提示。创建出的每个工作台容器通过环境变量注入
 平台统一的 DeepSeek Key（容器内使用，不回传浏览器）。
 
-## 产品模式（网关 v0.4 / 镜像 1.3.0）
+## 产品模式（网关 v0.5 / 镜像 0.5.0）
 
 `.env` 里开启 `GW_PRODUCT_MODE=1` 后，demo 充当平台（kitsume 后端角色）：
 
-- 创建的工作台为 1.3.0 镜像，注入 `GW_PRODUCT_MODE` / `GW_ADMIN_TOKEN` / `GW_PRESET_*`
+- 创建的工作台为 0.5.0 镜像，注入 `GW_PRODUCT_MODE` / `GW_ADMIN_TOKEN` / `GW_PRESET_*`
 - demo 调用 `/settings` 时自动带 `X-GW-Admin`，因此设置面板仍可编辑人设/记忆（平台视角）
 - 容器内：用户权限锁死 workspace-write、执行目录锁定 `/workspace`、预设对用户 API 不可见、
   设置文件存于 `/home/node/.dsh/`（workspace 外）
