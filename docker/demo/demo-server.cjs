@@ -37,7 +37,13 @@ const IMAGE = process.env.DSH_IMAGE || "registry.cn-shanghai.aliyuncs.com/eftik/
 const CPU = Number(process.env.DSH_CPU || 1);
 const MEM = Number(process.env.DSH_MEM || 2);
 
-// 产品模式：demo-server 充当平台（kitsume 后端的角色）
+// 产品模式：demo-server 充当平台（kitsume 后端的角色）。
+// 下面这些 env 会在"创建工作台"时注入到容器里，模拟生产部署的Sealos env 注入：
+//   GW_PRODUCT_MODE=1     容器网关进入产品模式（锁沙箱/隐藏平台预设，见 gateway.js PRODUCT_MODE）
+//   GW_ADMIN_TOKEN        平台管理令牌 → 容器内 X-GW-Admin 头的判定凭据
+//   GW_PRESET_BACKGROUND  平台预设人设背景（用户不可见不可改）
+//   GW_PRESET_MEMORY      平台预设记忆（用户不可见不可改）
+// demo-server 自身不设 GW_PRODUCT_MODE 时，创建出的容器为完全开放模式（联调用）。
 const ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
 const PRODUCT_ENV = [
   process.env.GW_PRODUCT_MODE === "1" ? { name: "GW_PRODUCT_MODE", value: "1" } : null,

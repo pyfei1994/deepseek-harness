@@ -1,5 +1,5 @@
 /**
- * eftik-dsh-cloud in-pod 网关 v0.4
+ * eftik-dsh-cloud in-pod 网关 v0.5
  * 运行在 DSH 容器内，监听 0.0.0.0:8090，业务方（kitsume 后端）HTTP 调用。
  * 零依赖，Node 22+。
  *
@@ -39,6 +39,11 @@
  *
  *   GET  /health        -> {"ok","dsh","version","jobs"}
  *
+ * 工作区文件接口（v0.5，仅限 GW_WORKDIR 内，防目录穿越/符号链接逃逸）：
+ *   GET  /files?path=/dir    -> {"path","entries":[{name,type,size,mtime}]}，目录优先排序
+ *   GET  /files/download?path=/f  文件流下载（application/octet-stream，200MB 上限
+ *                            可用 GW_MAX_DOWNLOAD_MB 调整；目录与非文件返回 400）
+ *
  * 鉴权：请求头 X-GW-Token 必须等于环境变量 GW_TOKEN（未设置则不鉴权，仅限内网调试）。
  */
 const http = require("http");
@@ -50,6 +55,14 @@ const GATEWAY_VERSION = "gateway/0.5";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
+/**
+ * 产品模式开关（Sealos 生产容器由平台注入 GW_PRODUCT_MODE=1）。
+ * =1：同一镜像从"开发者自由模式"切到"租户生产模式"，限制见下方各生效点：
+ *   1. 沙箱锁死    → POST /settings 里用户改 permissionMode 被忽略（只能用部署值）
+ *   2. 平台预设隐藏 → background/memory 仅 X-GW-Admin 可读写（USER_HIDDEN_FIELDS）
+ *   3. 前导保密    → buildSystemPreamble 注入指令禁止模型复述系统上下文
+ * 不设或非 1：行为同 v0.3，全部字段开放（demo / 内网联调用）。
+ */
 const PRODUCT_MODE = process.env.GW_PRODUCT_MODE === "1";
 const WORKDIR = process.env.GW_WORKDIR || "/workspace";
 const SETTINGS_PATH = process.env.GW_SETTINGS_PATH || "/home/node/.dsh/eftik-settings.json";
@@ -71,6 +84,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   memory: process.env.GW_PRESET_MEMORY || "",
 });
 
+/** 管理员判定：请求头 X-GW-Admin = GW_ADMIN_TOKEN 视为平台方（kitsume 后端持有，容器内用户拿不到） */
 const isAdmin = (req) => Boolean(GW_ADMIN_TOKEN) && req.headers["x-gw-admin"] === GW_ADMIN_TOKEN;
 /** 用户可见字段：产品模式下平台预设与权限对普通调用方隐藏 */
 const USER_HIDDEN_FIELDS = ["background", "memory"];
@@ -186,6 +200,7 @@ function openDownload(rel) {
 
 /* ---------- 任务组装 ---------- */
 
+/** 任务前导指令组装：平台预设（人设/记忆）+ 推理等级 + 保密/工作目录约束，包成 <system-context> 注入任务首部 */
 function buildSystemPreamble(s) {
   const parts = [];
   if (s.background) parts.push(`【角色背景】\n${s.background}`);
