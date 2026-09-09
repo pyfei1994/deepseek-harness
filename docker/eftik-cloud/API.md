@@ -1,9 +1,9 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:0.6.0`（网关 `gateway/0.6`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
+> 适用版本：镜像 `eftik-dsh-cloud:0.6.2`（网关 `gateway/0.7`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
 >
 > 镜像 tag 自 0.5.0 起与网关版本对齐（0.5.0 = 网关 v0.5）；镜像自身修订从第三位递增（0.5.1、0.5.2…），网关升版则前两位跟随
-> 更新时间：2026-09-06
+> 更新时间：2026-09-09
 
 网关运行在每个用户的 DSH 工作台容器内，监听容器 `0.0.0.0:8090`，是业务后端（kitsume）操作工作台的唯一入口。业务方不直接接触 dsh CLI。
 
@@ -279,6 +279,35 @@ curl -O -J -H "X-GW-Token: <gwToken>" "https://<工作台地址>/files/download?
 
 > 上传接口暂未提供（M2 按需设计：multipart + 配额校验）。
 
+### GET /storage
+
+工作区容量：`GW_WORKDIR`（默认 `/workspace`）挂载点的文件系统统计（statfs，即 PVC 容量）。
+供业务方（kitsume）在小程序/中台展示存储用量。
+
+**返回（200）**
+
+```json
+{
+  "path": "/workspace",
+  "usedBytes": 1288490188,
+  "totalBytes": 5368709120,
+  "freeBytes": 4080218932,
+  "usedPct": 24
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `path` | 统计的挂载点（= GW_WORKDIR） |
+| `usedBytes` | 真实已用（blocks - bfree） |
+| `totalBytes` | 文件系统总容量（PVC 大小） |
+| `freeBytes` | 非特权用户可写空间（bavail，扣除保留块） |
+| `usedPct` | 已用百分比（四舍五入） |
+
+```bash
+curl -H "X-GW-Token: <gwToken>" "https://<工作台地址>/storage"
+```
+
 ---
 
 ## 6. 业务后端对接流程（kitsume）
@@ -313,3 +342,4 @@ curl -O -J -H "X-GW-Token: <gwToken>" "https://<工作台地址>/files/download?
 | gateway/0.4 | 1.3.0 | 产品模式 `GW_PRODUCT_MODE`：permissionMode 锁定部署值、background/memory 仅平台（X-GW-Admin）可读写、env 预设注入；设置文件移出 workspace（/home/node/.dsh/，含旧路径自动迁移）；spawn cwd 锁定 /workspace；系统前导注入保密指令与工作目录约定 |
 | gateway/0.5 | 0.5.0 | 工作区文件接口：GET /files 目录列表、GET /files/download 流式下载（防穿越/防符号链接逃逸，下载上限 `GW_MAX_DOWNLOAD_MB` 默认 200MB） |
 | gateway/0.6 | 0.6.0 | 任务级 token 消耗：/task 与 SSE done 新增 `usage` 字段。经外挂插件 usage-probe（--patch 注入，零内核改动）监听 assistant/message 的 provider 精确 usage 累加落盘，网关读取后随任务返回 |
+| gateway/0.7 | 0.6.2 | 工作区容量：GET /storage 返回 /workspace 挂载点 statfs 统计（usedBytes/totalBytes/freeBytes/usedPct），供小程序与中台展示存储用量 |

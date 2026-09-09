@@ -46,6 +46,11 @@
  *   GET  /files/download?path=/f  文件流下载（application/octet-stream，200MB 上限
  *                            可用 GW_MAX_DOWNLOAD_MB 调整；目录与非文件返回 400）
  *
+ * 工作区容量接口（v0.7）：
+ *   GET  /storage       -> {"path","usedBytes","totalBytes","freeBytes","usedPct"}
+ *                          基于 GW_WORKDIR 挂载点的文件系统统计（PVC 容量，statfs），
+ *                          供业务方展示工作区存储用量。
+ *
  * 鉴权：请求头 X-GW-Token 必须等于环境变量 GW_TOKEN（未设置则不鉴权，仅限内网调试）。
  */
 const http = require("http");
@@ -53,7 +58,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/0.6";
+const GATEWAY_VERSION = "gateway/0.7";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -186,6 +191,17 @@ function listFiles(rel) {
     return { name: e.name, type, size, mtime: Math.round(mtime) };
   }).sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1));
   return { code: 200, body: { path: path.posix.normalize("/" + String(rel || "/").replace(/\\/g, "/")), entries } };
+}
+
+/** 工作区容量：GW_WORKDIR 挂载点的文件系统统计（PVC 容量，statfs） */
+async function storageStat() {
+  const s = await fs.promises.statfs(WORKDIR);
+  const bsize = Number(s.bsize) || 4096;
+  const totalBytes = bsize * Number(s.blocks);
+  const freeBytes = bsize * Number(s.bavail); // 非特权用户可用空间
+  const usedBytes = Math.max(0, totalBytes - bsize * Number(s.bfree)); // 真实已用
+  const usedPct = totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : 0;
+  return { path: WORKDIR, usedBytes, totalBytes, freeBytes, usedPct };
 }
 
 /** 下载：返回 {stream, size, filename} 或错误对象 */
@@ -373,6 +389,11 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && url.pathname === "/health") {
       return send(res, 200, { ok: true, dsh: dshVersion, version: GATEWAY_VERSION, jobs: jobs.size });
+    }
+
+    /* ---------- 工作区容量 ---------- */
+    if (req.method === "GET" && url.pathname === "/storage") {
+      return send(res, 200, await storageStat());
     }
 
     /* ---------- 设置 ---------- */
