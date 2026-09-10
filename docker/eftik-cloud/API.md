@@ -1,6 +1,6 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:0.6.3`（网关 `gateway/0.8`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
+> 适用版本：镜像 `eftik-dsh-cloud:0.6.4`（网关 `gateway/0.9`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
 >
 > 镜像 tag 自 0.5.0 起与网关版本对齐（0.5.0 = 网关 v0.5）；镜像自身修订从第三位递增（0.5.1、0.5.2…），网关升版则前两位跟随
 > 更新时间：2026-09-09
@@ -308,6 +308,46 @@ curl -O -J -H "X-GW-Token: <gwToken>" "https://<工作台地址>/files/download?
 curl -H "X-GW-Token: <gwToken>" "https://<工作台地址>/storage"
 ```
 
+### 技能（gateway/0.9）
+
+技能 = 可复用的指令模板（名称 + 图标 + 描述 + prompt）。已启用技能注入每次任务的系统前导
+（能力指引）；`POST /chat` 传 `skillId` 可直接按技能执行。持久化于 `/home/node/.dsh/eftik-skills.json`（PVC）。
+
+```
+GET    /skills                 -> {"skills":[{id,name,icon,description,prompt,enabled,createdAt,updatedAt}]}
+POST   /skills                 {name, icon?, description?, prompt, enabled?} -> skill
+PUT    /skills/{id}            部分更新（同上字段可选）
+DELETE /skills/{id}            -> {ok:true}
+```
+
+`POST /chat` 新增可选 `skillId`：`{skillId, message?}` → 以技能 prompt 为主指令执行任务。
+
+### 定时任务（gateway/0.9）
+
+网关内置 30s 调度 tick，到期任务自动以 `{task: prompt}` 提交执行（与手动任务同一串行队列，
+token 消耗同样经 usage-probe 统计）。持久化于 `/home/node/.dsh/eftik-tasks.json`（PVC）。
+
+```
+GET    /tasks                  -> {"tasks":[{id,name,icon,description,prompt,schedule,enabled,
+                                          lastRunAt,lastStatus,lastError,runs[≤10],createdAt,updatedAt}]}
+POST   /tasks                  {name, icon?, description?, prompt, schedule, enabled?} -> task
+PUT    /tasks/{id}             部分更新
+DELETE /tasks/{id}             -> {ok:true}
+POST   /tasks/{id}/run         立即执行一次 -> {task_id}
+GET    /tasks/{id}/runs        -> {taskId,lastStatus,lastRunAt,runs[≤10]}
+```
+
+schedule 三种形态：
+
+| type | 字段 | 说明 |
+|------|------|------|
+| `interval` | `minutes` 1~10080 | 每 N 分钟执行一次 |
+| `daily` | `time` "HH:MM" | 每天固定时刻 |
+| `weekly` | `days` [0-6]、`time` | 每周指定天（0=周日），按容器本地时区（生产建议 env TZ=Asia/Shanghai）|
+
+run 记录：`{id(网关任务id), at, status(done/failed/timeout/running), error, reply(前500字)}`。
+容器重启后 `running` 态超过 10 分钟会被调度器标记为 failed（中断）。
+
 ---
 
 ## 6. 业务后端对接流程（kitsume）
@@ -344,3 +384,4 @@ curl -H "X-GW-Token: <gwToken>" "https://<工作台地址>/storage"
 | gateway/0.6 | 0.6.0 | 任务级 token 消耗：/task 与 SSE done 新增 `usage` 字段。经外挂插件 usage-probe（--patch 注入，零内核改动）监听 assistant/message 的 provider 精确 usage 累加落盘，网关读取后随任务返回 |
 | gateway/0.7 | 0.6.2 | 工作区容量：GET /storage 返回 /workspace 挂载点 statfs 统计（usedBytes/totalBytes/freeBytes/usedPct），供小程序与中台展示存储用量 |
 | gateway/0.8 | 0.6.3 | 修复空工作区已用虚高：usedBytes 改为递归统计 /workspace 实际文件大小（du 语义），totalBytes/freeBytes 仍取 statfs PVC 配额；共享存储池上 statfs used 会计入同盘其他数据 |
+| gateway/0.9 | 0.6.4 | 技能与定时任务：/skills、/tasks CRUD + 网关内置 30s 调度器（interval/daily/weekly）、手动触发与执行记录；已启用技能注入系统前导，/chat 支持 skillId |
