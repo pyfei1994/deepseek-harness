@@ -48,7 +48,8 @@
  *
  * 工作区容量接口（v0.7）：
  *   GET  /storage       -> {"path","usedBytes","totalBytes","freeBytes","usedPct"}
- *                          基于 GW_WORKDIR 挂载点的文件系统统计（PVC 容量，statfs），
+ *                          usedBytes 为 /workspace 实际文件大小（du 语义），
+ *                          totalBytes/freeBytes 基于 GW_WORKDIR 挂载点 statfs（PVC 配额），
  *                          供业务方展示工作区存储用量。
  *
  * 鉴权：请求头 X-GW-Token 必须等于环境变量 GW_TOKEN（未设置则不鉴权，仅限内网调试）。
@@ -58,7 +59,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/0.7";
+const GATEWAY_VERSION = "gateway/0.8";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -193,13 +194,38 @@ function listFiles(rel) {
   return { code: 200, body: { path: path.posix.normalize("/" + String(rel || "/").replace(/\\/g, "/")), entries } };
 }
 
-/** 工作区容量：GW_WORKDIR 挂载点的文件系统统计（PVC 容量，statfs） */
+/** 递归累加目录内真实文件大小（du 语义，跳过符号链接，忽略无权限项） */
+async function duBytes(root) {
+  let total = 0;
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); }
+    catch { continue; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      try {
+        const st = await fs.promises.lstat(p);
+        if (st.isSymbolicLink()) continue;
+        if (st.isDirectory()) stack.push(p);
+        else total += st.size;
+      } catch {}
+    }
+  }
+  return total;
+}
+
+/** 工作区容量：usedBytes 为 /workspace 内实际文件大小（du 语义），
+ *  totalBytes/freeBytes 取挂载点 statfs（PVC 配额）。
+ *  注：v0.7 曾用 statfs 的 used，但在共享存储池上会把同盘其他数据计入，
+ *  导致空工作区也显示已用若干 GB，v0.8 改为递归统计。 */
 async function storageStat() {
   const s = await fs.promises.statfs(WORKDIR);
   const bsize = Number(s.bsize) || 4096;
   const totalBytes = bsize * Number(s.blocks);
   const freeBytes = bsize * Number(s.bavail); // 非特权用户可用空间
-  const usedBytes = Math.max(0, totalBytes - bsize * Number(s.bfree)); // 真实已用
+  const usedBytes = await duBytes(WORKDIR);   // 实际工作区文件占用
   const usedPct = totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : 0;
   return { path: WORKDIR, usedBytes, totalBytes, freeBytes, usedPct };
 }

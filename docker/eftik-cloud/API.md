@@ -1,6 +1,6 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:0.6.2`（网关 `gateway/0.7`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
+> 适用版本：镜像 `eftik-dsh-cloud:0.6.3`（网关 `gateway/0.8`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
 >
 > 镜像 tag 自 0.5.0 起与网关版本对齐（0.5.0 = 网关 v0.5）；镜像自身修订从第三位递增（0.5.1、0.5.2…），网关升版则前两位跟随
 > 更新时间：2026-09-09
@@ -281,8 +281,8 @@ curl -O -J -H "X-GW-Token: <gwToken>" "https://<工作台地址>/files/download?
 
 ### GET /storage
 
-工作区容量：`GW_WORKDIR`（默认 `/workspace`）挂载点的文件系统统计（statfs，即 PVC 容量）。
-供业务方（kitsume）在小程序/中台展示存储用量。
+工作区容量。`usedBytes` 为 `/workspace` 内实际文件大小（递归 du 语义，跳过符号链接），
+`totalBytes`/`freeBytes` 取挂载点 statfs（PVC 配额）。供业务方（kitsume）在小程序/中台展示存储用量。
 
 **返回（200）**
 
@@ -299,7 +299,7 @@ curl -O -J -H "X-GW-Token: <gwToken>" "https://<工作台地址>/files/download?
 | 字段 | 说明 |
 |------|------|
 | `path` | 统计的挂载点（= GW_WORKDIR） |
-| `usedBytes` | 真实已用（blocks - bfree） |
+| `usedBytes` | /workspace 内实际文件总大小（du 语义） |
 | `totalBytes` | 文件系统总容量（PVC 大小） |
 | `freeBytes` | 非特权用户可写空间（bavail，扣除保留块） |
 | `usedPct` | 已用百分比（四舍五入） |
@@ -343,3 +343,4 @@ curl -H "X-GW-Token: <gwToken>" "https://<工作台地址>/storage"
 | gateway/0.5 | 0.5.0 | 工作区文件接口：GET /files 目录列表、GET /files/download 流式下载（防穿越/防符号链接逃逸，下载上限 `GW_MAX_DOWNLOAD_MB` 默认 200MB） |
 | gateway/0.6 | 0.6.0 | 任务级 token 消耗：/task 与 SSE done 新增 `usage` 字段。经外挂插件 usage-probe（--patch 注入，零内核改动）监听 assistant/message 的 provider 精确 usage 累加落盘，网关读取后随任务返回 |
 | gateway/0.7 | 0.6.2 | 工作区容量：GET /storage 返回 /workspace 挂载点 statfs 统计（usedBytes/totalBytes/freeBytes/usedPct），供小程序与中台展示存储用量 |
+| gateway/0.8 | 0.6.3 | 修复空工作区已用虚高：usedBytes 改为递归统计 /workspace 实际文件大小（du 语义），totalBytes/freeBytes 仍取 statfs PVC 配额；共享存储池上 statfs used 会计入同盘其他数据 |
