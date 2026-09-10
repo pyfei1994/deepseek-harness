@@ -4,4 +4,12 @@ set -e
 
 chown -R node:node /home/node/.dsh /workspace 2>/dev/null || true
 
+(
+  while true; do
+    setpriv --reuid=node --regid=node --clear-groups node /opt/gw/web-ui.js
+    code=$?
+    echo "[web-supervisor] proxy exited $code, restarting" >&2
+    sleep 2
+  done
+) &
 exec setpriv --reuid=node --regid=node --clear-groups node /opt/gw/gateway.js

@@ -41,6 +41,14 @@
  *
  *   GET  /health        -> {"ok","dsh","version","jobs"}
  *
+ * 模型凭证接口（v1.0）：
+ *   GET    /credentials/deepseek -> {configured,provider,suffix}，不返回明文
+ *   PUT    /credentials/deepseek {apiKey}，原子写入 DSH 原生凭证文件（0600）
+ *   DELETE /credentials/deepseek
+ *
+ * 统一插件目录（v1.0）：
+ *   GET /plugins -> Skills 与任务的统一只读视图；安装和编辑仍走各类型专用接口
+ *
  * 工作区文件接口（v0.5，仅限 GW_WORKDIR 内，防目录穿越/符号链接逃逸）：
  *   GET  /files?path=/dir    -> {"path","entries":[{name,type,size,mtime}]}，目录优先排序
  *   GET  /files/download?path=/f  文件流下载（application/octet-stream，200MB 上限
@@ -76,7 +84,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/0.9";
+const GATEWAY_VERSION = "gateway/1.0";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -94,6 +102,10 @@ const SETTINGS_PATH = process.env.GW_SETTINGS_PATH || "/home/node/.dsh/eftik-set
 const LEGACY_SETTINGS_PATH = "/workspace/.eftik-settings.json";
 const SKILLS_PATH = process.env.GW_SKILLS_PATH || "/home/node/.dsh/eftik-skills.json";
 const TASKS_PATH = process.env.GW_TASKS_PATH || "/home/node/.dsh/eftik-tasks.json";
+const CREDENTIALS_PATH = process.env.GW_CREDENTIALS_PATH || "/home/node/.dsh/.credentials.yaml";
+const WEB_PASSWORD_PATH = process.env.GW_WEB_PASSWORD_PATH || "/home/node/.dsh/eftik-web-password.sha256";
+const DSH_HOME = process.env.DSH_HOME || "/home/node/.dsh";
+const PLUGIN_RELOAD_PATH = path.join(DSH_HOME, "eftik-plugin-reload");
 const TIMEOUT_MS = Number(process.env.DSH_TIMEOUT_MS || 600000);
 const MAX_EVENTS = 200;
 const MAX_HISTORY = 20;
@@ -101,6 +113,109 @@ const MAX_DOWNLOAD_BYTES = Number(process.env.GW_MAX_DOWNLOAD_MB || 200) * 1024 
 const PERMISSION_MODES = ["read-only", "workspace-write", "danger-full-access"];
 const REASONING_LEVELS = ["low", "balanced", "high"];
 const MAX_TEXT = 32768;
+let pluginOperation = false;
+
+/* ---------- DSH 原生插件 ---------- */
+
+function profileManifest(profile) {
+  const manifest = loadJsonFile(path.join(DSH_HOME, "profiles", profile, "package.json"), {});
+  const deps = manifest.dependencies || {};
+  const bundles = new Set((((manifest.dsh || {}).profile || {}).bundles) || []);
+  const builtIns = new Set(["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-headless"]);
+  return Object.entries(deps).filter(([name]) => !builtIns.has(name)).map(([name, version]) => ({
+    name, version: String(version), profile, enabled: bundles.has(name), type: "dsh-plugin"
+  }));
+}
+
+function validPluginSpec(spec) {
+  // 产品端只允许 npm 包名/版本；拒绝 git、URL、本地路径，避免远程 prepare 脚本绕过审核。
+  return /^(?:@[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*|[a-z0-9][a-z0-9._-]*)(?:@[a-zA-Z0-9*_.+~^-]+)?$/.test(spec);
+}
+
+function pluginPackageName(spec) {
+  const slash = spec.indexOf("/");
+  const at = spec.lastIndexOf("@");
+  return at > slash ? spec.slice(0, at) : spec;
+}
+
+function runPlugin(profile, verb, spec) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("dsh", ["plugin", "--profile", profile, verb, spec], {
+      cwd: WORKDIR, env: process.env, windowsHide: true
+    });
+    let output = "";
+    const collect = chunk => { output = (output + chunk.toString()).slice(-16000); };
+    child.stdout.on("data", collect);
+    child.stderr.on("data", collect);
+    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("插件操作超时")); }, 180000);
+    child.on("error", error => { clearTimeout(timer); reject(error); });
+    child.on("exit", code => {
+      clearTimeout(timer);
+      if (code === 0) resolve(output);
+      else reject(new Error(output.trim() || `dsh plugin exited ${code}`));
+    });
+  });
+}
+
+function inspectPlugin(spec) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("pnpm", ["view", spec, "--json"], { cwd: WORKDIR, env: process.env, windowsHide: true });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", chunk => { stdout = (stdout + chunk.toString()).slice(-100000); });
+    child.stderr.on("data", chunk => { stderr = (stderr + chunk.toString()).slice(-16000); });
+    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("查询 npm 插件信息超时")); }, 30000);
+    child.on("error", error => { clearTimeout(timer); reject(error); });
+    child.on("exit", code => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error("npm 中没有找到这个包或指定版本"));
+      try {
+        const metadata = JSON.parse(stdout);
+        const value = Array.isArray(metadata) ? metadata[metadata.length - 1] : metadata;
+        if (!value || !value.dsh || !value.dsh.bundle || typeof value.dsh.bundle.patch !== "string") {
+          return reject(new Error("这个 npm 包不是 DSH 插件：缺少 package.json 的 dsh.bundle.patch 声明"));
+        }
+        resolve({ name: value.name || pluginPackageName(spec), version: value.version || "" });
+      } catch (error) {
+        reject(error.message && error.message.includes("不是 DSH 插件") ? error : new Error("npm 返回的插件元数据无法解析"));
+      }
+    });
+  });
+}
+
+/* ---------- DeepSeek BYOK ---------- */
+
+function yamlQuoted(value) {
+  return JSON.stringify(String(value));
+}
+
+function readDeepSeekCredential() {
+  try {
+    const text = fs.readFileSync(CREDENTIALS_PATH, "utf8");
+    const match = text.match(/^\s{2}DEEPSEEK_API_KEY:\s*(.+)\s*$/m);
+    if (!match) return "";
+    try { return JSON.parse(match[1]); } catch { return match[1].trim(); }
+  } catch { return ""; }
+}
+
+function writeDeepSeekCredential(value) {
+  fs.mkdirSync(path.dirname(CREDENTIALS_PATH), { recursive: true, mode: 0o700 });
+  const temp = `${CREDENTIALS_PATH}.${process.pid}.tmp`;
+  const body = `version: 1\n\nrefs:\n  DEEPSEEK_API_KEY: ${yamlQuoted(value)}\n\nrecords: {}\n`;
+  fs.writeFileSync(temp, body, { mode: 0o600 });
+  fs.chmodSync(temp, 0o600);
+  fs.renameSync(temp, CREDENTIALS_PATH);
+}
+
+function deepSeekCredentialView() {
+  const value = readDeepSeekCredential();
+  return { configured: Boolean(value), provider: "deepseek", suffix: value ? value.slice(-4) : "" };
+}
+
+// 兼容旧部署：首次启动将 Sealos 环境变量迁移到 DSH 原生凭证文件，随后从网关进程环境移除。
+if (process.env.DEEPSEEK_API_KEY) {
+  if (!readDeepSeekCredential()) writeDeepSeekCredential(process.env.DEEPSEEK_API_KEY);
+  delete process.env.DEEPSEEK_API_KEY;
+}
 
 const DEFAULT_SETTINGS = Object.freeze({
   model: "",                    // 空 = 内核默认（deepseek-v4-flash）
@@ -594,6 +709,86 @@ const server = http.createServer(async (req, res) => {
     /* ---------- 工作区容量 ---------- */
     if (req.method === "GET" && url.pathname === "/storage") {
       return send(res, 200, await storageStat());
+    }
+
+    /* ---------- 模型凭证（只返回状态，不返回明文） ---------- */
+    if (req.method === "GET" && url.pathname === "/credentials/deepseek") {
+      return send(res, 200, deepSeekCredentialView());
+    }
+    if (req.method === "PUT" && url.pathname === "/credentials/deepseek") {
+      const body = await readBody(req);
+      const apiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+      if (apiKey.length < 16 || apiKey.length > 512 || /[\r\n]/.test(apiKey)) {
+        return send(res, 400, { error: "DeepSeek API Key 格式不正确" });
+      }
+      writeDeepSeekCredential(apiKey);
+      return send(res, 200, deepSeekCredentialView());
+    }
+    if (req.method === "DELETE" && url.pathname === "/credentials/deepseek") {
+      try { fs.unlinkSync(CREDENTIALS_PATH); } catch (e) { if (e.code !== "ENOENT") throw e; }
+      return send(res, 200, deepSeekCredentialView());
+    }
+
+    if (req.method === "GET" && url.pathname === "/web-access") {
+      let configured = false;
+      try { configured = Boolean(fs.readFileSync(WEB_PASSWORD_PATH, "utf8").trim()); } catch {}
+      return send(res, 200, { configured });
+    }
+    if (req.method === "PUT" && url.pathname === "/web-access") {
+      const body = await readBody(req);
+      const password = typeof body.password === "string" ? body.password : "";
+      if (password.length < 8 || password.length > 64 || /[\r\n]/.test(password)) {
+        return send(res, 400, { error: "访问密码须为 8-64 个字符" });
+      }
+      fs.mkdirSync(path.dirname(WEB_PASSWORD_PATH), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(WEB_PASSWORD_PATH, require("crypto").createHash("sha256").update(password).digest("hex"), { mode: 0o600 });
+      fs.chmodSync(WEB_PASSWORD_PATH, 0o600);
+      return send(res, 200, { configured: true });
+    }
+
+    /* ---------- DSH 原生插件中心 ---------- */
+    if (req.method === "GET" && url.pathname === "/plugins") {
+      return send(res, 200, {
+        plugins: profileManifest("web").concat(profileManifest("headless")),
+        profiles: ["web", "headless"]
+      });
+    }
+    if (req.method === "POST" && url.pathname === "/plugins/install") {
+      if (pluginOperation) return send(res, 409, { error: "已有插件操作正在进行" });
+      const body = await readBody(req);
+      const spec = typeof body.spec === "string" ? body.spec.trim() : "";
+      const profile = body.profile === "headless" ? "headless" : "web";
+      if (!validPluginSpec(spec)) return send(res, 400, { error: "仅支持 npm 插件包名，可附带固定版本" });
+      pluginOperation = true;
+      const packageName = pluginPackageName(spec);
+      const existedBefore = profileManifest(profile).some(item => item.name === packageName);
+      try {
+        const metadata = await inspectPlugin(spec);
+        const output = await runPlugin(profile, "add", spec);
+        const installed = profileManifest(profile).find(item => item.name === metadata.name && item.enabled);
+        if (!installed) {
+          if (!existedBefore) await runPlugin(profile, "remove", metadata.name).catch(() => {});
+          return send(res, 400, { error: "包已下载但未被 DSH 启用，残留依赖已自动清理" });
+        }
+        fs.writeFileSync(PLUGIN_RELOAD_PATH, String(Date.now()));
+        return send(res, 200, { installed: true, name: metadata.name, version: metadata.version, profile, output });
+      } catch (error) {
+        if (!existedBefore) await runPlugin(profile, "remove", packageName).catch(() => {});
+        return send(res, 400, { error: error.message || "插件安装失败，残留依赖已清理" });
+      } finally { pluginOperation = false; }
+    }
+    if (req.method === "POST" && url.pathname === "/plugins/remove") {
+      if (pluginOperation) return send(res, 409, { error: "已有插件操作正在进行" });
+      const body = await readBody(req);
+      const name = typeof body.name === "string" ? body.name.trim() : "";
+      const profile = body.profile === "headless" ? "headless" : "web";
+      if (!validPluginSpec(name) || name.includes("@", 1)) return send(res, 400, { error: "插件包名不正确" });
+      pluginOperation = true;
+      try {
+        const output = await runPlugin(profile, "remove", name);
+        fs.writeFileSync(PLUGIN_RELOAD_PATH, String(Date.now()));
+        return send(res, 200, { removed: true, name, profile, output });
+      } finally { pluginOperation = false; }
     }
 
     /* ---------- 设置 ---------- */
