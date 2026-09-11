@@ -1,6 +1,6 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:0.6.4`（网关 `gateway/0.9`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
+> 适用版本：镜像 `eftik-dsh-cloud:0.6.10`（网关 `gateway/1.0`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
 >
 > 镜像 tag 自 0.5.0 起与网关版本对齐（0.5.0 = 网关 v0.5）；镜像自身修订从第三位递增（0.5.1、0.5.2…），网关升版则前两位跟随
 > 更新时间：2026-09-09
@@ -221,19 +221,32 @@ curl -X POST https://<工作台地址>/settings \
 
 ### GET /task/{task_id}/stream
 
-SSE 实时流（替代轮询）。每个事件以 `event:` + `data:` 两行发出：
+SSE 实时流（推荐，实现逐字打字机效果）。每个事件以 `event:` + `data:` 两行发出：
 
 ```
-event: log
-data: {"t":1788620083000,"text":"dsh: reasoning:"}
+event: thinking
+data: {"text":"用户想要一个脚本…","t":1788620083000}
+
+event: answer
+data: {"text":"好的","t":1788620083100}
+
+event: answer
+data: {"text":"，我来","t":1788620083350}
 
 event: done
-data: {"status":"done","reply":"...","error":"","elapsed_ms":15230,"usage":{...}}
+data: {"status":"done","reply":"好的，我来写一个。","error":"","elapsed_ms":15230,"usage":{...}}
 ```
 
-- `log` 事件增量推送执行进度（500ms 批量刷新）
-- `done` 事件携带最终结果，随后服务端关闭连接
-- 断开后可回退用 `GET /task/{task_id}` 补拉全量
+| 事件 | 含义 |
+|------|------|
+| `answer` | **正文增量**：headless stdout 的每个 chunk 原样下发，前端累加即得打字机效果。完整正文 = 所有 answer 的 `text` 按序拼接（与 `done.reply` 一致） |
+| `thinking` | **思考增量**：headless 打在 stderr 的 `dsh: reasoning:` 段，剥离前缀后下发（ANSI 已清除）。无 reasoning 的模型不会有该事件 |
+| `log` | 运行日志行（工具调用等），可展示为"正在干活"动态 |
+| `done` | 终态，携带 `reply`/`error`/`elapsed_ms`/`usage`，随后服务端关闭连接 |
+
+- 事件按产生即推（stdout/stderr 到达即发），非定时批量，延迟 ≈ 模型输出延迟
+- 断开后可回退用 `GET /task/{task_id}` 补拉全量（`reply` 在任务运行期间即为已产出的部分正文）
+- 调用方按 `answer` / `thinking` 分流：正文渲染 markdown，思考渲染为可折叠的思考块
 
 ### DELETE /task/{task_id}
 
@@ -368,7 +381,9 @@ run 记录：`{id(网关任务id), at, status(done/failed/timeout/running), erro
 5. 闲置：SnailJob 扫描 → Applaunchpad POST /apps/{name}/pause（PVC 保留）
 ```
 
-**注意**：kitume 后端自身不解析 SSE，轮询 `/task/{task_id}` 即可；SSE 面向未来小程序端直连场景预留。
+**流式链路**：kitsume 后端订阅 `GET /task/{task_id}/stream`，把 `answer` / `thinking` 增量经
+小程序上下文（WebSocket 或 SSE）透传，前端用 TDesign `t-chat-markdown` 渲染并显示流式光标；
+网关 `done` 到达后，后端把最终 reply 落 `ek_dsh_chat_message` 并下发收尾事件。
 
 ---
 

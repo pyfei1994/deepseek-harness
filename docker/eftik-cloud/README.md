@@ -7,7 +7,7 @@
 | 文件 | 用途 |
 |------|------|
 | `Dockerfile` | 镜像定义：node:24-trixie + `@deepseek-ai/dsh@<分支对应版本>` + tini/git，无浏览器/noVNC/Web UI |
-| `gateway.js` | in-pod HTTP 网关：`POST /chat` 异步任务 + `GET /task/:id` 轮询 + 进度事件采集 + `X-GW-Token` 鉴权 |
+| `gateway.js` | in-pod HTTP 网关：对话任务、DeepSeek BYOK 凭证、统一插件目录与 `X-GW-Token` 鉴权 |
 | `entrypoint.sh` | root 启动修 PVC 属主（Sealos PVC 为 root 所有）→ setpriv 降权到 node 跑网关 |
 
 ## 构建 / 推送
@@ -15,9 +15,9 @@
 ```bash
 # 镜像命名约定：eftik-dsh-cloud:<主版本>.0-gw<网关修订>
 docker build -f docker/eftik-cloud/Dockerfile \
-  -t registry.cn-shanghai.aliyuncs.com/eftik-dsh-cloud:1.0.0 .
+  -t registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:0.6.10 docker/eftik-cloud
 
-docker push registry.cn-shanghai.aliyuncs.com/eftik-dsh-cloud:1.0.0
+docker push registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:0.6.10
 ```
 
 > 早期探索版（基于 runzhliu 社区基座）为 `eftik/dsh-workspace:0.x` 系列，
@@ -31,9 +31,9 @@ docker push registry.cn-shanghai.aliyuncs.com/eftik-dsh-cloud:1.0.0
 
 ## Sealos 部署参数（Applaunchpad POST /apps）
 
-- `image.imageName`: `eftik-dsh-cloud:1.0.0`（`imageRegistry` 凭据必带，私有仓库）
+- `image.imageName`: `eftik-dsh-cloud:0.6.10`（`imageRegistry` 凭据必带，私有仓库）
 - `launchCommand` 不需要（镜像 ENTRYPOINT 已是网关）
 - `ports`: `[{number: 8090, protocol: "http", isPublic: false}]`（后端入集群后）；过渡期 `isPublic: true`
-- `env`: `GW_TOKEN`（随机）、`DEEPSEEK_API_KEY`（secretKeyRef）
+- `env`: `GW_TOKEN`（随机）、首次创建时的用户 `DEEPSEEK_API_KEY`（网关启动后迁移到 `$DSH_HOME/.credentials.yaml` 并从进程环境移除）
 - `storage`: `dsh-home → /home/node/.dsh`（1Gi）、`workspace → /workspace`（2Gi）
 - 首次启动若遇节点 PVC 授权瞬时报错，restart 一次即可

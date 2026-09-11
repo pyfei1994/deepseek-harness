@@ -9,7 +9,9 @@
  *   GET  /task/:id        -> {"status","reply","error","events","elapsed_ms",
  *                            "usage":{calls,inputTokens,outputTokens,totalTokens,
  *                            cacheReadTokens,cacheWriteTokens,reasoningTokens}|null}
- *   GET  /task/:id/stream SSE 实时流：event: log / event: done（done 携带 usage）
+ *   GET  /task/:id/stream SSE 实时流：event: answer（正文增量，逐字流式）
+ *                            / event: thinking（思考增量）/ event: log（运行日志）
+ *                            / event: done（终态，携带 usage）
  *   DELETE /task/:id      取消任务
  *
  * 设置接口（持久化到 GW_SETTINGS_PATH，默认 /home/node/.dsh/eftik-settings.json，
@@ -84,7 +86,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/1.0";
+const GATEWAY_VERSION = "gateway/1.1";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -381,11 +383,9 @@ function isDue(t, now) {
 /** 到期任务执行：与 /chat 同一串行队列；结束后回写任务状态与执行记录 */
 function runScheduledTask(store, t, trigger) {
   const settings = loadSettings();
-  const job = {
-    id: newId("t"), task: composeTask({ task: t.prompt }, settings), settings,
-    status: "queued", reply: "", error: "", events: [], createdAt: Date.now(),
-    source: { type: trigger, taskId: t.id, taskName: t.name },
-  };
+  const job = newJob(newId("t"), composeTask({ task: t.prompt }, settings), settings, {
+    type: trigger, taskId: t.id, taskName: t.name,
+  });
   jobs.set(job.id, job);
   t.lastRunAt = Date.now();
   t.lastStatus = "running";
@@ -562,6 +562,68 @@ function composeTask(body, settings) {
 
 /* ---------- 执行 ---------- */
 
+/** 任务对象工厂：统一带上增量流缓冲字段（stream/seq/waiters） */
+function newJob(id, task, settings, source) {
+  const job = {
+    id, task, settings,
+    status: "queued", reply: "", error: "", events: [], createdAt: Date.now(),
+    stream: [],    // [{seq,kind:'answer'|'thinking',text,t}] 增量事件（正文/思考）
+    seq: 0,        // 增量事件序号游标
+    waiters: [],   // 等待新增量的订阅回调（streamTask 用）
+  };
+  if (source) job.source = source;
+  return job;
+}
+
+/* 增量事件缓冲：answer/thinking 与日志事件共用一条 seq 序号 + 等待者唤醒机制。
+   订阅方（streamTask）按 seq 游标消费，既能拿全量历史也能实时收增量。 */
+
+/** 推送正文增量（stdout chunk） */
+function pushAnswer(job, text) {
+  job.seq = (job.seq || 0) + 1;
+  job.stream.push({ seq: job.seq, kind: "answer", text, t: Date.now() });
+  flushStream(job);
+}
+
+/** 推送思考增量（stderr 的 dsh: reasoning: 段） */
+function pushThinking(job, text) {
+  job.seq = (job.seq || 0) + 1;
+  job.stream.push({ seq: job.seq, kind: "thinking", text, t: Date.now() });
+  flushStream(job);
+}
+
+/** 唤醒正在消费该 job 增量流的订阅方 */
+function flushStream(job) {
+  const waiters = job.waiters;
+  if (!waiters || !waiters.length) return;
+  job.waiters = [];
+  for (const w of waiters) {
+    try { w(); } catch {}
+  }
+}
+
+/** 等待新增量或任务进入终态；timeoutMs 到点也返回，便于订阅方做心跳 */
+function waitStream(job, timeoutMs) {
+  if (job.status !== "queued" && job.status !== "running") return Promise.resolve();
+  return new Promise((resolve) => {
+    let done = false;
+    const fire = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(fire, timeoutMs);
+    job.waiters = job.waiters || [];
+    job.waiters.push(fire);
+  });
+}
+
+/** 去掉终端 ANSI 控制序列（dsh 在 TTY 下会给 reasoning 段上色） */
+function stripAnsi(s) {
+  return String(s).replace(/\u001b\[[0-9;]*[A-Za-z]/g, "");
+}
+
 function runDsh(job) {
   return new Promise((resolve) => {
     const args = ["--profile", "headless"];
@@ -609,12 +671,28 @@ function runDsh(job) {
       try { child.kill("SIGKILL"); } catch {}
     }, TIMEOUT_MS);
 
-    child.stdout.on("data", (d) => (stdout += d));
+    // stdout = 最终答案。headless 是纯文本流式输出，这里把每个 chunk 作为 answer 增量
+    // 推给订阅方（/task/:id/stream 的 event: answer），实现逐字打字机效果；
+    // 同时累积到 job.reply，任务结束时 /task/:id 仍能一次性拿到全文（兼容轮询调用方）。
+    child.stdout.on("data", (d) => {
+      const chunk = d.toString();
+      stdout += chunk;
+      job.reply = stdout;
+      if (chunk) pushAnswer(job, chunk);
+    });
     child.stderr.on("data", (d) => {
       stderrTail = (stderrTail + d).slice(-4000);
-      const lines = d.toString().split("\n").filter(Boolean);
-      for (const l of lines) {
-        if (job.events.length < MAX_EVENTS) job.events.push({ t: Date.now(), text: l.slice(0, 300) });
+      // headless 把 provider reasoning delta 打在 stderr，按 "dsh: reasoning:" 分段。
+      // 该前缀行本身不是内容，剥离后作为思考增量下发；其余 stderr 仍是日志事件。
+      for (const raw of d.toString().split("\n")) {
+        if (!raw) continue;
+        const line = stripAnsi(raw);
+        const head = line.match(/^dsh:\s*reasoning:\s?(.*)$/);
+        if (head) {
+          if (head[1]) pushThinking(job, head[1] + "\n");
+          continue;
+        }
+        if (job.events.length < MAX_EVENTS) job.events.push({ t: Date.now(), text: line.slice(0, 300) });
       }
     });
     child.on("error", (e) => {
@@ -644,6 +722,9 @@ function runDsh(job) {
         job.status = "failed";
         job.error = `dsh 退出码 ${code}: ${(stderrTail || stdout).slice(-500)}`;
       }
+      job.finishedAt = job.finishedAt || Date.now();
+      // 增量流收尾：唤醒订阅方，让它立刻看到终态（不必等下一次轮询）
+      flushStream(job);
       resolve();
     });
   });
@@ -675,25 +756,47 @@ function readBody(req, limit = 1 << 20) {
 let dshVersion = "";
 try { dshVersion = execSync("dsh --version", { encoding: "utf8" }).trim(); } catch {}
 
-/** SSE：把 job 的增量事件与最终结果推给调用方 */
-function streamTask(req, res, job) {
+/** SSE：把 job 的增量事件与最终结果推给调用方。
+ *  事件：
+ *    event: answer   正文增量（逐字流式，data={text}）
+ *    event: thinking 思考增量（data={text}）
+ *    event: log      运行日志（data={t,text}）
+ *    event: done     终态（data={status,reply,error,elapsed_ms,usage}）
+ */
+async function streamTask(req, res, job) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
   });
-  let sent = 0;
-  const timer = setInterval(() => {
+  const write = (event, data) => {
+    try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch {}
+  };
+  let cursor = 0;   // stream 游标
+  let sent = 0;     // events（日志）游标
+  let closed = false;
+  req.on("close", () => { closed = true; });
+
+  while (!closed) {
+    while (cursor < job.stream.length) {
+      const e = job.stream[cursor++];
+      write(e.kind === "thinking" ? "thinking" : "answer", { text: e.text, t: e.t });
+    }
     for (; sent < job.events.length; sent++) {
-      res.write(`event: log\ndata: ${JSON.stringify(job.events[sent])}\n\n`);
+      write("log", job.events[sent]);
     }
     if (["done", "failed", "timeout"].includes(job.status)) {
-      clearInterval(timer);
-      res.write(`event: done\ndata: ${JSON.stringify({ status: job.status, reply: job.reply, error: job.error, elapsed_ms: (job.finishedAt || Date.now()) - job.createdAt, usage: job.usage || null })}\n\n`);
-      res.end();
+      write("done", {
+        status: job.status, reply: job.reply, error: job.error,
+        elapsed_ms: (job.finishedAt || Date.now()) - job.createdAt,
+        usage: job.usage || null,
+      });
+      break;
     }
-  }, 500);
-  req.on("close", () => clearInterval(timer));
+    await waitStream(job, 1000);
+  }
+  try { res.end(); } catch {}
 }
 
 const server = http.createServer(async (req, res) => {
@@ -953,7 +1056,7 @@ const server = http.createServer(async (req, res) => {
         return send(res, 400, { error: "task 或 message 必填（拼装后 ≤200000 字符）" });
       }
       const id = `t-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const job = { id, task, settings, status: "queued", reply: "", error: "", events: [], createdAt: Date.now() };
+      const job = newJob(id, task, settings);
       jobs.set(id, job);
       // 单用户容器内串行执行
       enqueue(() => {
