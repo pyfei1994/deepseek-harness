@@ -86,7 +86,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/1.3";
+const GATEWAY_VERSION = "gateway/1.5";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -721,9 +721,16 @@ function flushStream(job) {
   }
 }
 
-/** 等待新增量或任务进入终态；timeoutMs 到点也返回，便于订阅方做心跳 */
+/** 等待新增量或任务进入终态；timeoutMs 到点也返回，便于订阅方做心跳。
+ *
+ *  ⚠️ 注意：终态（done/failed/timeout）在回放队列走完之前不解除阻塞。
+ *  markJobFinished 会用 settledAt 记录「回放结束时刻」，订阅方据此继续等，
+ *  否则 waitStream 会立刻 resolve → streamTask 忙轮询 → CPU 打满。
+ */
 function waitStream(job, timeoutMs) {
-  if (job.status !== "queued" && job.status !== "running") return Promise.resolve();
+  const settled = ["done", "failed", "timeout"].includes(job.status);
+  const settleAt = job.settledAt || job.finishedAt || 0;
+  if (settled && Date.now() >= settleAt) return Promise.resolve();
   return new Promise((resolve) => {
     let done = false;
     const fire = () => {
@@ -763,10 +770,194 @@ function sdkAccumulate(job, type, text) {
   if (!text) return;
   if (type === "answer") {
     job.reply = (job.reply || "") + text;
+    // 标记已推过正文增量：新版走 replayAssistantStream，旧版走这里，
+    // 两条路径都置位，避免终态兜底时整段重复推给前端。
+    job.answerPushed = true;
     pushAnswer(job, text);
   } else {
     job.thinking = (job.thinking || "") + text;
     pushThinking(job, text);
+  }
+}
+
+/**
+ * 归一化 dsh 的错误对象成 { message, code }。
+ * dsh 的错误形状不统一：有 {message, code, status}，也有 ProviderError 包一层
+ * { name, data: {...} }，还有直接给字符串的情况。统一收敛，避免前端看到 "[object Object]"。
+ */
+function sdkErrorMessage(err) {
+  if (err == null) return { message: "未知错误", code: "" };
+  if (typeof err === "string") return { message: err, code: "" };
+  const message = err.message || (err.data && err.data.message) || JSON.stringify(err);
+  const code = err.code || (err.data && (err.data.code || err.data.type)) || "";
+  return { message: String(message), code: code ? String(code) : "" };
+}
+
+/**
+ * 从 assistant/message 事件提取正文（只取 text 块，丢弃 reasoning 块）。
+ * 兼容三种形状：
+ *   1. 新版：message.content = [{type:"text",text}, {type:"reasoning",text}]
+ *   2. 旧版：message.text / data.text（字符串）
+ *   3. 兜底：message.content 是字符串
+ */
+function extractAssistantText(data) {
+  const msg = (data && data.message) || {};
+  const content = msg.content;
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const block of content) {
+      if (!block) continue;
+      // 只收正文；reasoning / tool-call 等块不算答案
+      if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
+    }
+    if (parts.length) return parts.join("");
+  }
+  if (typeof content === "string" && content) return content;
+  if (typeof msg.text === "string" && msg.text) return msg.text;
+  if (data && typeof data.text === "string" && data.text) return data.text;
+  return "";
+}
+
+/** 提取 reasoning 块文本（新版把思考放在 message.content 的 reasoning 块里） */
+function extractReasoningText(data) {
+  const msg = (data && data.message) || {};
+  const content = msg.content;
+  if (!Array.isArray(content)) return "";
+  const parts = [];
+  for (const block of content) {
+    if (block && block.type === "reasoning" && typeof block.text === "string") parts.push(block.text);
+  }
+  return parts.join("");
+}
+
+/** 提取 usage（新版在 data.usage；也在 stream 的 chunk.usage 里，两处取先有的） */
+function extractUsage(data) {
+  const u = (data && data.usage) || null;
+  if (u) return normalizeUsage(u);
+  const stream = (data && data.stream) || [];
+  for (const item of stream) {
+    const c = item && item.chunk;
+    if (c && c.type === "usage" && c.usage) return normalizeUsage(c.usage);
+  }
+  return null;
+}
+
+/** 统一 usage 字段名（与旧版 chunk.usage / usage-probe 插件字段名保持一致） */
+function normalizeUsage(u) {
+  return {
+    calls: 1,
+    inputTokens: u.inputTokens != null ? u.inputTokens : null,
+    outputTokens: u.outputTokens != null ? u.outputTokens : null,
+    totalTokens: u.totalTokens != null ? u.totalTokens : null,
+    cacheReadTokens: u.cacheReadTokens != null ? u.cacheReadTokens : null,
+    cacheWriteTokens: u.cacheWriteTokens != null ? u.cacheWriteTokens : null,
+    reasoningTokens: u.reasoningTokens != null ? u.reasoningTokens : null,
+  };
+}
+
+/**
+ * 把新版 assistant/message.stream 回放成打字机增量。
+ *
+ * 新版把整段回答打包成若干 {type:"text-chunks"|"reasoning-chunks", dt:[], texts:[]}
+ * 一次性下发（不再有 assistant/chunk 事件），网关负责按 dt（相邻块毫秒间隔）
+ * 还原出「逐字吐出」的时序，让 /task/{id}/stream 的 SSE 消费方拿到与旧版
+ * assistant/chunk 等价的增量流。
+ *
+ * 回放节奏做了压缩：真按原始 dt 回放，长回答可能要等十几秒才推完，而此刻
+ * 网络早已拿到全文 —— 用户感知反而是「卡住」。这里按 REPLAY_SPEED 缩放并把
+ * 单块间隔钳制在 [MIN,MAX]，保证既流畅又不过拖。
+ *
+ * ⚠️ 关键竞态：assistant/message 与 turn/end 在同一批 stdout 行里前后脚到达，
+ * 此时回放队列还排在 setTimeout 里，而 turn/end 已经把 job 置成 done。
+ * streamTask 的循环「读到终态即 break」，于是它在第一个定时器触发前就退出了
+ * —— 表现就是 SSE 里 answer/thinking 事件数为 0，前端只有最终回复没有打字机。
+ * 解法：在 job 上记录 replayUntil（回放队列的预计跑完时刻），终态对订阅方
+ * 可见的时间推迟到该时刻之后（见 markJobFinished / streamTask）。
+ */
+const REPLAY_SPEED = 0.5;      // dt 缩放：0.5 = 两倍速
+const REPLAY_MIN_GAP = 4;      // 单块最小间隔（ms）
+const REPLAY_MAX_GAP = 60;     // 单块最大间隔（ms）
+const REPLAY_MAX_ITEMS = 4000; // 单条消息回放块上限，防御异常长回答
+const REPLAY_MAX_MS = 20000;   // 单条消息回放总时长上限，防御异常 dt
+
+function replayAssistantStream(job, data) {
+  const stream = (data && data.stream) || [];
+  // 收集待回放块，保持出现顺序（reasoning 通常在 text 之前）
+  const queue = [];
+  for (const item of stream) {
+    if (!item) continue;
+    const kind = item.type === "text-chunks" ? "answer"
+      : item.type === "reasoning-chunks" ? "thinking" : null;
+    if (!kind) continue;
+    const texts = Array.isArray(item.texts) ? item.texts : [];
+    const dt = Array.isArray(item.dt) ? item.dt : [];
+    for (let i = 0; i < texts.length; i++) {
+      const t = texts[i];
+      if (typeof t !== "string" || !t) continue;
+      const gap = Number(dt[i]) || REPLAY_MIN_GAP;
+      queue.push({ kind, text: t, gap });
+      if (queue.length >= REPLAY_MAX_ITEMS) break;
+    }
+    if (queue.length >= REPLAY_MAX_ITEMS) break;
+  }
+  const hasAnswerChunk = queue.some((q) => q.kind === "answer");
+  if (!queue.length) {
+    // 老版本没有 stream（增量已由 assistant/chunk 给过，job.answerPushed 为真）
+    // 或结构异常：只在正文从未推过且拿得到全文时兜底推一次，避免前端空屏。
+    if (job.reply && !job.answerPushed) {
+      job.answerPushed = true;
+      pushAnswer(job, job.reply);
+    }
+    return;
+  }
+  const now = Date.now();
+  let delay = 0;
+  let last = now;
+  for (const item of queue) {
+    delay += Math.min(REPLAY_MAX_GAP, Math.max(REPLAY_MIN_GAP, item.gap * REPLAY_SPEED));
+    if (delay > REPLAY_MAX_MS) break;   // 超长回答不再无限拖，剩余部分由全文兜底
+    last = now + delay;
+    setTimeout(() => {
+      if (item.kind === "answer") pushAnswer(job, item.text);
+      else pushThinking(job, item.text);
+    }, delay);
+  }
+  // 有正文增量块就标记已推送，避免 turn/end 兜底时整段重复推
+  if (hasAnswerChunk) {
+    job.answerPushed = true;
+  } else if (job.reply && !job.answerPushed) {
+    job.answerPushed = true;
+    setTimeout(() => pushAnswer(job, job.reply), delay + REPLAY_MIN_GAP);
+    last = now + delay + REPLAY_MIN_GAP;
+  }
+  // 记录回放预计跑完时刻：终态要等它走完才对订阅方可见
+  job.replayUntil = Math.max(job.replayUntil || 0, last);
+}
+
+/**
+ * 标记任务终态，但把「对订阅方可见」的时刻推迟到回放队列跑完之后。
+ *
+ * streamTask 是「读到 done/failed/timeout 就发 done 事件并 break」的模型，
+ * 所以不能让 job.status 抢在增量前面生效。这里拆成两步：
+ *   doneAt = 回放结束时刻（无回放则为 now）
+ *   status 立即置位（供 /task/{id} 轮询等非流式消费方立刻拿到结果）
+ *   settledAt = doneAt，streamTask 只在 Date.now() >= settledAt 时才发终态
+ * 这样 HTTP 轮询不受影响，SSE 又能拿到完整的打字机增量。
+ */
+function markJobFinished(job, status, now) {
+  job.status = status;
+  job.finishedAt = now;
+  const until = job.replayUntil || 0;
+  job.settledAt = until > now ? until : now;
+  if (job.settledAt > now) {
+    // 回放期间保持「非终态可见」：唤醒订阅方继续消费增量
+    flushStream(job);
+    const wait = job.settledAt - now + 10;
+    const timer = setTimeout(() => { job.settleTimer = null; flushStream(job); }, wait);
+    if (timer.unref) timer.unref();
+    job.settleTimer = timer;
+  } else {
+    flushStream(job);
   }
 }
 
@@ -823,22 +1014,66 @@ function handleSdkLine(job, line) {
     return;
   }
 
-  // 一轮结束：assistant/message 带完整正文，作为最终答案的权威来源
+  // 一轮结束：assistant/message 带完整正文，作为最终答案的权威来源。
+  //
+  // ⚠️ 正文位置随 dsh 版本变化：
+  //   旧版：data.message.text / data.text（单一字符串）+ 独立的 assistant/chunk 增量事件
+  //   新版（0.1.5+）：data.message.content = [{type:"reasoning",text},{type:"text",text}]
+  //     且**不再有 assistant/chunk 事件**，增量改放 data.stream 数组里：
+  //       {type:"reasoning-chunks", dt:[49,11,...], texts:["The"," user",...]}
+  //       {type:"text-chunks",      dt:[...],      texts:["1","、","2",...]}
+  //     dt 是相邻块之间的毫秒间隔，整段一次性到达。
+  // 因此这里做两件事：① 取权威正文 ② 把 stream 回放成打字机增量。
   if (ev.type === "assistant/message") {
-    const text = (data.message && data.message.text) || data.text || "";
+    const text = extractAssistantText(data);
     if (text) job.reply = text;
+    job.usage = extractUsage(data) || job.usage;
+    // 新版的思考内容藏在 content 的 reasoning 块里，回放/兜底都要用
+    job.thinking = extractReasoningText(data) || job.thinking;
+    replayAssistantStream(job, data);
     return;
   }
 
   // turn/end = 本次任务跑完。SDK profile 是常驻会话（会一直等下一轮输入），
   // 单任务语义下必须在此收尾并关闭子进程，否则任务永远不会进入终态。
+  //
+  // ⚠️ turn/end 分两种：正常跑完（reason.kind 非 error）与「因错误终止」。
+  // dsh 在模型请求失败时**不会**回 JSON-RPC error，而是照常发 turn/end，把原因
+  // 藏在 data.reason.error 里，例如：
+  //   {"type":"turn/end","data":{"turn":1,"reason":{"kind":"error",
+  //     "error":{"message":"Authentication Fails...","code":"AUTH","status":401}}}}
+  // 早期实现无视 reason 一律置 done，于是「Key 失效 / 模型报错 / 限流」这类
+  // 失败全部伪装成成功：前端看到转圈结束但没有任何正文，也没有任何提示。
+  // 这里按 reason 区分：有 error 就报 failed 并透出原始 message。
   if (ev.type === "turn/end") {
     if (job.status === "queued" || job.status === "running") {
-      job.status = "done";
-      job.reply = (job.reply || "").trim();
-      job.finishedAt = Date.now();
-      recordSessionReply(job);
-      flushStream(job);
+      const reason = data.reason || {};
+      const err = reason.error;
+      const hasError = (reason.kind === "error" || err) && err;
+      if (hasError) {
+        const parsed = sdkErrorMessage(err);
+        job.error = "SDK: " + parsed.message;
+        if (parsed.code) job.error += " (" + parsed.code + ")";
+        if (job.events.length < MAX_EVENTS) {
+          job.events.push({ t: Date.now(), text: job.error });
+        }
+        markJobFinished(job, "failed", Date.now());
+      } else if (!(job.reply || "").trim()) {
+        // 无错误也无正文：既非正常回答，也不是显式失败。旧实现会置 done，
+        // 前端表现为「转圈结束但空屏」——用户无法区分是模型没答还是系统坏了。
+        // 这种情况（空回答 / 事件结构不兼容 / 内容被策略拦截）明确报 failed，
+        // 让调用方看到可诊断的信号，而不是静默成功。
+        job.error = "SDK: 模型未返回任何内容（turn/end reason=" +
+          (reason.kind || "unknown") + "）";
+        if (job.events.length < MAX_EVENTS) {
+          job.events.push({ t: Date.now(), text: job.error });
+        }
+        markJobFinished(job, "failed", Date.now());
+      } else {
+        job.reply = (job.reply || "").trim();
+        recordSessionReply(job);
+        markJobFinished(job, "done", Date.now());
+      }
     }
     // 优雅收尾：先发 shutdown，再兜底 SIGKILL（SDK 会 dispose 整棵运行时后退出）
     try { job.sdkSend && job.sdkSend({ jsonrpc: "2.0", id: 99, method: "shutdown", params: {} }); } catch {}
@@ -1118,7 +1353,15 @@ async function streamTask(req, res, job) {
     for (; sent < job.events.length; sent++) {
       write("log", job.events[sent]);
     }
+    // 终态可见性由 settledAt 决定：新版回放（replayAssistantStream）把增量排在
+    // 定时器里，而 turn/end 几乎同时到达并已置 status=done。这里必须等回放队列
+    // 跑完再发 done，否则订阅方在第一个增量事件之前就 break，打字机效果全丢。
     if (["done", "failed", "timeout"].includes(job.status)) {
+      const settleAt = job.settledAt || job.finishedAt || 0;
+      if (Date.now() < settleAt) {
+        await waitStream(job, Math.min(settleAt - Date.now(), 1000));
+        continue;   // 回放尚未走完，继续消费增量
+      }
       write("done", {
         status: job.status, reply: job.reply, error: job.error,
         elapsed_ms: (job.finishedAt || Date.now()) - job.createdAt,
