@@ -570,9 +570,19 @@ function newJob(id, task, settings, source) {
     stream: [],    // [{seq,kind:'answer'|'thinking',text,t}] 增量事件（正文/思考）
     seq: 0,        // 增量事件序号游标
     waiters: [],   // 等待新增量的订阅回调（streamTask 用）
+    // 执行 profile：sdk = 逐字流式（默认，打字机效果），headless = 一次性输出。
+    // 单次任务可通过 settings.stream=false 或 body.profile 覆盖，便于排障回退。
+    dshProfile: resolveProfile(settings),
   };
   if (source) job.source = source;
   return job;
+}
+
+/** profile 选择：settings.stream === false 或 body.profile='headless' 时回退 headless */
+function resolveProfile(settings) {
+  if (process.env.DSH_FORCE_HEADLESS === "1") return "headless";
+  if (settings && settings.stream === false) return "headless";
+  return "sdk";
 }
 
 /* 增量事件缓冲：answer/thinking 与日志事件共用一条 seq 序号 + 等待者唤醒机制。
@@ -624,9 +634,154 @@ function stripAnsi(s) {
   return String(s).replace(/\u001b\[[0-9;]*[A-Za-z]/g, "");
 }
 
+/* ---------- SDK profile 驱动（逐字流式） ----------
+
+   headless 只在进程结束时把最终答案一次性写 stdout，无法做打字机效果；
+   SDK profile 用 stdio JSON-RPC 暴露整条会话事件流，其中
+   session.event/assistant/chunk 携带 provider 级 delta：
+
+     {"type":"assistant/chunk","data":{"chunk":{"type":"text-delta","text":"你"}}}
+     {"type":"assistant/chunk","data":{"chunk":{"type":"reasoning-delta","text":"The"}}}
+     {"type":"assistant/chunk","data":{"chunk":{"type":"usage",...}}}
+     {"type":"assistant/message","data":{...}}   ← 一轮结束，text 为完整正文
+
+   协议只有三个方法：initialize / session/prompt / shutdown。
+   会话由 session/prompt 首次带 sessionId 时隐式创建。
+*/
+
+/** 累积 SDK 会话正文（供 done 时回填 job.reply） */
+function sdkAccumulate(job, type, text) {
+  if (!text) return;
+  if (type === "answer") {
+    job.reply = (job.reply || "") + text;
+    pushAnswer(job, text);
+  } else {
+    job.thinking = (job.thinking || "") + text;
+    pushThinking(job, text);
+  }
+}
+
+/** 解析一行 SDK stdout：可能是 JSON-RPC 响应，也可能是 session.event 通知 */
+function handleSdkLine(job, line) {
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; }
+
+  // JSON-RPC 响应：initialize / session/prompt 的握手与回执
+  if (msg.id != null && (msg.result !== undefined || msg.error !== undefined)) {
+    if (msg.error) {
+      job.status = "failed";
+      job.error = "SDK: " + (msg.error.message || JSON.stringify(msg.error));
+      try { job.child && job.child.kill("SIGKILL"); } catch {}
+      return;
+    }
+    // initialize 成功（id=1）→ 此刻才允许下发任务
+    if (msg.id === 1) startSdkPrompt(job);
+    return;
+  }
+
+  if (msg.method !== "session.event") return;
+  const ev = (msg.params && msg.params.event) || {};
+  const data = ev.data || {};
+
+  if (ev.type === "assistant/chunk") {
+    const c = data.chunk || {};
+    if (c.type === "text-delta") {
+      sdkAccumulate(job, "answer", c.text || "");
+    } else if (c.type === "reasoning-delta") {
+      sdkAccumulate(job, "thinking", c.text || "");
+    } else if (c.type === "usage") {
+      // provider 精确 usage：字段与 usage-probe 插件一致
+      job.usage = {
+        calls: (job.usage && job.usage.calls ? job.usage.calls : 0) + 1,
+        inputTokens: c.inputTokens != null ? c.inputTokens : null,
+        outputTokens: c.outputTokens != null ? c.outputTokens : null,
+        totalTokens: c.totalTokens != null ? c.totalTokens : null,
+        cacheReadTokens: c.cacheReadTokens != null ? c.cacheReadTokens : null,
+        cacheWriteTokens: c.cacheWriteTokens != null ? c.cacheWriteTokens : null,
+        reasoningTokens: c.reasoningTokens != null ? c.reasoningTokens : null,
+      };
+    }
+    return;
+  }
+
+  // 一轮结束：assistant/message 带完整正文，作为最终答案的权威来源
+  if (ev.type === "assistant/message") {
+    const text = (data.message && data.message.text) || data.text || "";
+    if (text) job.reply = text;
+    return;
+  }
+
+  // turn/end = 本次任务跑完。SDK profile 是常驻会话（会一直等下一轮输入），
+  // 单任务语义下必须在此收尾并关闭子进程，否则任务永远不会进入终态。
+  if (ev.type === "turn/end") {
+    if (job.status === "queued" || job.status === "running") {
+      job.status = "done";
+      job.reply = (job.reply || "").trim();
+      job.finishedAt = Date.now();
+      flushStream(job);
+    }
+    // 优雅收尾：先发 shutdown，再兜底 SIGKILL（SDK 会 dispose 整棵运行时后退出）
+    try { job.sdkSend && job.sdkSend({ jsonrpc: "2.0", id: 99, method: "shutdown", params: {} }); } catch {}
+    setTimeout(() => { try { job.child && job.child.kill("SIGKILL"); } catch {} }, 1500);
+    return;
+  }
+
+  // 工具调用 / 状态变化收为运行日志，供「正在干活」动态展示
+  if (["tool/start", "tool/end", "step/start", "turn/start", "sandbox/mode", "approval/policy"].includes(ev.type)) {
+    if (job.events.length < MAX_EVENTS) {
+      job.events.push({ t: Date.now(), text: ev.type + (data.name ? ": " + data.name : "") });
+    }
+  }
+}
+
+/** 挂载 SDK profile 的 stdout 解析与任务下发 */
+function handleSdkStdout(job, child) {
+  job.child = child;
+  let buf = "";
+  child.stdout.on("data", (d) => {
+    buf += d.toString();
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (line) handleSdkLine(job, line);
+    }
+  });
+
+  // 握手必须严格串行：initialize 报错 "SDK server is not initialized"，
+  // session/prompt 又要求已 initialize —— 所以等 initialize 的 JSON-RPC 响应回来再下发 prompt。
+  const provider = job.settings.provider || "deepseek-official";
+  const model = job.settings.model || "deepseek-chat";
+  const sessionId = "task-" + job.id;
+  const send = (obj) => {
+    try { child.stdin.write(JSON.stringify(obj) + "\n"); } catch {}
+  };
+
+  job.sdkSend = send;
+  send({
+    jsonrpc: "2.0", id: 1, method: "initialize",
+    params: { cwd: WORKDIR, provider, model },
+  });
+  // initialize 的响应由 handleSdkLine 识别（id=1 且无 error）后触发 prompt
+  job.sdkSessionId = sessionId;
+}
+
+/** initialize 就绪后下发本任务的 prompt */
+function startSdkPrompt(job) {
+  if (job.sdkPromptSent) return;
+  job.sdkPromptSent = true;
+  job.sdkSend({
+    jsonrpc: "2.0", id: 2, method: "session/prompt",
+    params: { sessionId: job.sdkSessionId, contentBlocks: [{ type: "text", text: job.task }] },
+  });
+}
+
 function runDsh(job) {
   return new Promise((resolve) => {
-    const args = ["--profile", "headless"];
+    // 默认 headless（一次任务、写完即退）；SDK profile 支持逐字流式，
+    // 由任务级开关 settings.stream 或环境变量 DSH_DEFAULT_PROFILE 打开。
+    const profile = job.dshProfile || "headless";
+    const args = ["--profile", profile];
     // 子进程 env 安全剥离：agent bash 里 `env` 可见全部环境变量，
     // GW_ADMIN_TOKEN/GW_TOKEN 是网关入站鉴权凭据，dsh 内核与插件都不需要——
     // 不剥离的话 prompt-injection 诱导 agent 执行 `env` 即可窃取平台令牌。
@@ -641,25 +796,33 @@ function runDsh(job) {
     // （新插件必须走 insert 块——patch 普通行只覆盖已存在的 id，匹配不到会静默跳过）。
     // 插件监听 assistant/message 的 usage（provider 精确值）任务级累加写盘，
     // 任务结束时网关读取 → /task/:id 返回给业务方计费；零 dsh 内核改动。
+    // SDK profile 直接从 chunk.usage 拿精确值，不需要该插件。
     const usageFile = `/tmp/dsh-usage-${job.id}.json`;
-    job.usageFile = usageFile;
-    const patchLines = [];
+    job.usageFile = profile === "headless" ? usageFile : null;
+    // patch 文件必须是「顶层 YAML 数组」——每个元素是一条 patch entry。
+    // 之前把 entry 直接平铺写进文件（缺外层 `- `），dsh-app-boot 的 parsePatchList
+    // 会以 "must be a top-level YAML array of loader patch entries" 直接退出。
+    // 这里用 JSON 写（YAML 1.2 是 JSON 超集，dsh 的解析器照常接受），顺带省掉手写转义。
+    const patchEntries = [];
     if (job.settings.model) {
       const provider = job.settings.provider || "deepseek-official";
-      patchLines.push(`- id: agent-default-model\n  config:\n    provider: '${provider}'\n    model: '${job.settings.model}'\n`);
+      patchEntries.push({ id: "agent-default-model", config: { provider, model: job.settings.model } });
     }
-    patchLines.push(
-      "- insert:\n" +
-      "    - id: usage-probe\n" +
-      "      name: 'file:///opt/gw/usage-probe.js'\n" +
-      "      config:\n" +
-      `        outputFile: '${usageFile}'\n`
-    );
+    if (profile === "headless") {
+      patchEntries.push({
+        insert: [{
+          id: "usage-probe",
+          name: "file:///opt/gw/usage-probe.js",
+          config: { outputFile: usageFile },
+        }],
+      });
+    }
     const patchPath = `/tmp/patch-${job.id}.yml`;
-    fs.writeFileSync(patchPath, patchLines.join(""));
+    fs.writeFileSync(patchPath, JSON.stringify(patchEntries, null, 2));
     args.push("--patch", patchPath);
 
-    args.push(job.task);
+    // headless 用位置参数传任务；SDK profile 由 stdin 的 session/prompt 下发
+    if (profile !== "sdk") args.push(job.task);
     // 锁死执行目录：用户任务只允许在 workspace 内办公
     try { fs.mkdirSync(WORKDIR, { recursive: true }); } catch {}
     const child = spawn("dsh", args, { cwd: WORKDIR, windowsHide: true, env: spawnEnv });
@@ -671,27 +834,26 @@ function runDsh(job) {
       try { child.kill("SIGKILL"); } catch {}
     }, TIMEOUT_MS);
 
-    // stdout = 最终答案。headless 是纯文本流式输出，这里把每个 chunk 作为 answer 增量
-    // 推给订阅方（/task/:id/stream 的 event: answer），实现逐字打字机效果；
-    // 同时累积到 job.reply，任务结束时 /task/:id 仍能一次性拿到全文（兼容轮询调用方）。
-    child.stdout.on("data", (d) => {
-      const chunk = d.toString();
-      stdout += chunk;
-      job.reply = stdout;
-      if (chunk) pushAnswer(job, chunk);
-    });
+    // headless 把最终答案一次性写 stdout，拿不到逐字增量；SDK profile 的
+    // session.event/assistant/chunk 才有 provider 级 delta（见下方 handleSdkFrame）。
+    if (job.dshProfile === "sdk") {
+      handleSdkStdout(job, child);
+    } else {
+      child.stdout.on("data", (d) => {
+        const chunk = d.toString();
+        stdout += chunk;
+        job.reply = stdout;
+        if (chunk) pushAnswer(job, chunk);
+      });
+    }
     child.stderr.on("data", (d) => {
       stderrTail = (stderrTail + d).slice(-4000);
-      // headless 把 provider reasoning delta 打在 stderr，按 "dsh: reasoning:" 分段。
-      // 该前缀行本身不是内容，剥离后作为思考增量下发；其余 stderr 仍是日志事件。
+      // 只把非空、非协议帧的 stderr 收为日志事件：SDK/headless 偶发空行与
+      // JSON-RPC 错误帧都不该污染「任务动态」。
       for (const raw of d.toString().split("\n")) {
         if (!raw) continue;
         const line = stripAnsi(raw);
-        const head = line.match(/^dsh:\s*reasoning:\s?(.*)$/);
-        if (head) {
-          if (head[1]) pushThinking(job, head[1] + "\n");
-          continue;
-        }
+        if (!line.trim() || line.startsWith("{")) continue;
         if (job.events.length < MAX_EVENTS) job.events.push({ t: Date.now(), text: line.slice(0, 300) });
       }
     });
@@ -699,30 +861,41 @@ function runDsh(job) {
       clearTimeout(timer);
       job.status = "failed";
       job.error = String(e.message || e);
+      flushStream(job);
       resolve();
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      job.finishedAt = Date.now();
-      // 读取 usage-probe 插件落盘的任务级 token 消耗（read-then-delete）
+      job.finishedAt = job.finishedAt || Date.now();
+      // 读取 usage-probe 插件落盘的任务级 token 消耗（read-then-delete）。
+      // SDK 模式下 usage 直接来自 chunk.usage 事件，无需插件。
       if (job.usageFile) {
         try {
           const raw = fs.readFileSync(job.usageFile, "utf8");
-          if (raw) job.usage = JSON.parse(raw);
+          if (raw && !job.usage) job.usage = JSON.parse(raw);
         } catch {}
         try { fs.unlinkSync(job.usageFile); } catch {}
       }
       if (job.status !== "timeout") { try { fs.unlinkSync(`/tmp/patch-${job.id}.yml`); } catch {} }
+      // 已是终态（SDK 的 turn/end 已定 done，进程是我们主动收掉的）：不再覆盖
+      if (job.status === "done" || job.status === "failed") {
+        flushStream(job);
+        resolve();
+        return;
+      }
       if (job.status === "timeout") {
         job.error = `dsh 超时（${TIMEOUT_MS / 1000}s）`;
       } else if (code === 0) {
         job.status = "done";
-        job.reply = stdout.trim();
+        // SDK 模式正文由 assistant/message 累积；headless 用 stdout
+        job.reply = job.dshProfile === "sdk"
+          ? (job.reply || "").trim()
+          : stdout.trim();
       } else {
         job.status = "failed";
-        job.error = `dsh 退出码 ${code}: ${(stderrTail || stdout).slice(-500)}`;
+        job.error = job.error || `dsh 退出码 ${code}: ${(stderrTail || stdout).slice(-500)}`;
       }
-      job.finishedAt = job.finishedAt || Date.now();
+      job.finishedAt = Date.now();
       // 增量流收尾：唤醒订阅方，让它立刻看到终态（不必等下一次轮询）
       flushStream(job);
       resolve();
@@ -1057,6 +1230,8 @@ const server = http.createServer(async (req, res) => {
       }
       const id = `t-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const job = newJob(id, task, settings);
+      // 单次任务覆盖执行 profile（排障用；缺省走 settings.stream 决定的 sdk）
+      if (body.profile === "headless") job.dshProfile = "headless";
       jobs.set(id, job);
       // 单用户容器内串行执行
       enqueue(() => {
