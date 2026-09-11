@@ -181,6 +181,15 @@ curl -X POST https://<工作台地址>/settings \
 
 > 提交时的 `settings` 快照会应用到该任务（模型、权限、背景等）。
 
+**可选字段**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `task` | string | 完整任务文本（与 `message`/`history` 二选一） |
+| `message` | string | 本条用户消息，与 `history` 拼装为任务 |
+| `history` | array | 会话历史（业务侧持久化裁剪后传入） |
+| `profile` | string | 覆盖 dsh profile：`"headless"` 强制一次性输出（无逐字流式）。默认走 `sdk` 真流式 |
+
 **返回（200）**
 
 ```json
@@ -239,14 +248,16 @@ data: {"status":"done","reply":"好的，我来写一个。","error":"","elapsed
 
 | 事件 | 含义 |
 |------|------|
-| `answer` | **正文增量**：headless stdout 的每个 chunk 原样下发，前端累加即得打字机效果。完整正文 = 所有 answer 的 `text` 按序拼接（与 `done.reply` 一致） |
-| `thinking` | **思考增量**：headless 打在 stderr 的 `dsh: reasoning:` 段，剥离前缀后下发（ANSI 已清除）。无 reasoning 的模型不会有该事件 |
-| `log` | 运行日志行（工具调用等），可展示为"正在干活"动态 |
+| `answer` | **正文增量**：SDK `session.event` → `assistant/chunk` 中 `chunk.type === "text-delta"` 的 `chunk.text`，原样下发，前端累加即得打字机效果。完整正文 = 所有 answer 的 `text` 按序拼接（与 `done.reply` 一致） |
+| `thinking` | **思考增量**：同一路径下 `chunk.type === "reasoning-delta"` 的 `chunk.text`，剥离标签后下发（ANSI 已清除）。无 reasoning 的模型不会有该事件 |
+| `log` | 运行日志行（工具调用 `tool/start`/`tool/end`、`step/start`、`turn/start` 等），可展示为"正在干活"动态 |
 | `done` | 终态，携带 `reply`/`error`/`elapsed_ms`/`usage`，随后服务端关闭连接 |
 
-- 事件按产生即推（stdout/stderr 到达即发），非定时批量，延迟 ≈ 模型输出延迟
+- **流式来源**：网关默认以 `--profile sdk` 启动 dsh，走 stdio JSON-RPC；`session.event` 通知按 chunk 推送，延迟 ≈ 模型 token 输出延迟（实测首片 1.3–2.2s）
+- 任务终态由 `turn/end` 事件决定（SDK 是常驻会话，`turn/end` 后网关补发 `shutdown` 并兜底 kill），`done` 事件随之发出
 - 断开后可回退用 `GET /task/{task_id}` 补拉全量（`reply` 在任务运行期间即为已产出的部分正文）
 - 调用方按 `answer` / `thinking` 分流：正文渲染 markdown，思考渲染为可折叠的思考块
+- 兼容开关：`DSH_FORCE_HEADLESS=1` 或请求体 `{"profile":"headless"}` 可退回 headless（**无逐字流式**，仅在任务结束一次性给出完整正文，或从 stdout 分块下发）
 
 ### DELETE /task/{task_id}
 
