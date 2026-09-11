@@ -2,11 +2,12 @@
 # 直接安装官方 @deepseek-ai/dsh npm 包，不依赖 runzhliu 社区镜像。
 # 面向 API/headless 场景：容器内只跑 in-pod 网关。
 # 构建（context 必须是本目录，COPY 才能找到 gateway.js）：
-# docker build -f docker/eftik-cloud/Dockerfile -t registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:0.6.10 docker/eftik-cloud
+# docker build --progress=plain --provenance=false -f docker/eftik-cloud/Dockerfile \
+#   -t registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:0.6.13 docker/eftik-cloud
 
 FROM node:24-trixie
 
-ARG DSH_VERSION=0.1.2-rc.1
+ARG DSH_VERSION=0.1.5-rc.1
 ARG PNPM_VERSION=10.15.1
 
 # tini：正确的信号转发与子进程回收；git：agent 常用工具链

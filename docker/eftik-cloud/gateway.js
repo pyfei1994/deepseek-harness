@@ -86,7 +86,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/1.2";
+const GATEWAY_VERSION = "gateway/1.3";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -273,6 +273,12 @@ function loadSettings() {
 function normalizeSettings(s) {
   const alias = REASONING_ALIASES[s.reasoning];
   if (alias) s.reasoning = alias;
+  // 空串归一：model/provider 语义是「空 = 用内核默认」，但下游若用它做
+  // truthy 判断容易踩空串（'' 是 falsy 但会被存进配置对象）。统一成 null，
+  // 让「未配置」在任何地方都只有一种表示。
+  for (const k of ["model", "provider", "reasoning"]) {
+    if (typeof s[k] === "string" && s[k].trim() === "") s[k] = null;
+  }
   return s;
 }
 
@@ -771,7 +777,17 @@ function handleSdkLine(job, line) {
 
   // JSON-RPC 响应：initialize / session/prompt 的握手与回执
   if (msg.id != null && (msg.result !== undefined || msg.error !== undefined)) {
+    // shutdown 的响应（id=99）必须无条件忽略：shutdown 是 turn/end 之后我们
+    // 主动发的收尾指令，此刻任务已经成功结束。dsh 在 dispose 整棵 cordis
+    // 运行时的过程中，残留插件可能对已卸载的 fiber 调 ctx.effect()，抛
+    // CordisError('INACTIVE_EFFECT')「cannot create effect on inactive context」，
+    // SDK 会把该异常作为 id=99 的 error 响应回传。若不加区分就把它当致命错误，
+    // 会把已经 done 的任务覆盖成 failed，前端显示一排红色报错（内容其实已产出）。
+    if (msg.id === 99) return;
     if (msg.error) {
+      // 已进入终态（done/timeout）的任务不再被后续 error 覆盖：这类错误几乎都来自
+      // 收尾阶段的竞态（见上），此时用户已经拿到完整回答，报错反而误导。
+      if (job.status === "done" || job.status === "timeout") return;
       job.status = "failed";
       job.error = "SDK: " + (msg.error.message || JSON.stringify(msg.error));
       try { job.child && job.child.kill("SIGKILL"); } catch {}
@@ -917,14 +933,35 @@ function runDsh(job) {
     // 模型 + 推理强度一起进 agent-default-model patch：headless profile 走
     // dsh 的 patch 机制而不是 SDK initialize，两处都要带 reasoningEffort，
     // 否则 headless 模式下同样拿不到 reasoning-delta。
+    //
+    // ⚠️ 关键：@deepseek-ai/dsh-agent-default-model 的 schema 里 provider 与
+    // model 都是**必填**（缺任一即报 "invalid config: $.xxx missing required
+    // value"）。原实现只在 settings.model 非空时才写 provider/model，但
+    // reasoningEffort 是独立追加的 —— 于是「默认设置（model/provider 均为空串，
+    // 仅 reasoning=high 有值）」这条最常见路径会生成 config:{reasoningEffort}，
+    // 缺 provider → 插件树加载失败 → cordis 把整棵 fiber 判死 → sdk profile 下
+    // 残余插件调 ctx.effect() 抛 CordisError('INACTIVE_EFFECT')
+    // 「cannot create effect on inactive context」。
+    //
+    // 实测（dsh 0.1.2-rc.1，headless + --patch）：
+    //   config:{reasoningEffort}                  → $.provider missing
+    //   config:{reasoningEffort,provider}         → $.model missing
+    //   config:{reasoningEffort,provider,model}   → 正常（与无 patch 基线一致）
+    // 因此：只要决定发这条 patch，provider 与 model 就必须双双补齐，
+    // 不能依赖「空 = 内核默认」——该语义在 patch 覆盖场景下不成立。
+    // 仅在用户确实什么都没配（provider/model/effort 全空）时跳过 patch，
+    // 让内核用 profile 自带默认值。
+    const KERNEL_DEFAULT_PROVIDER = "deepseek-official";
+    const KERNEL_DEFAULT_MODEL = "deepseek-chat";
     const modelCfg = {};
-    if (job.settings.model) {
-      modelCfg.provider = job.settings.provider || "deepseek-official";
-      modelCfg.model = job.settings.model;
-    }
     const effort = job.settings.reasoning;
     if (effort && effort !== "off") modelCfg.reasoningEffort = effort;
+    if (job.settings.model) modelCfg.model = job.settings.model;
+    if (job.settings.provider) modelCfg.provider = job.settings.provider;
     if (Object.keys(modelCfg).length) {
+      // 发送前把两个必填项补齐（用户的显式配置优先）
+      if (!modelCfg.provider) modelCfg.provider = KERNEL_DEFAULT_PROVIDER;
+      if (!modelCfg.model) modelCfg.model = KERNEL_DEFAULT_MODEL;
       patchEntries.push({ id: "agent-default-model", config: modelCfg });
     }
     if (profile === "headless") {

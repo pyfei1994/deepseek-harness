@@ -1,9 +1,9 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:0.6.10`（网关 `gateway/1.0`，内核 `@deepseek-ai/dsh 0.1.2-rc.1`）
+> 适用版本：镜像 `eftik-dsh-cloud:0.6.13`（网关 `gateway/1.3`，内核 `@deepseek-ai/dsh 0.1.5-rc.1`）
 >
 > 镜像 tag 自 0.5.0 起与网关版本对齐（0.5.0 = 网关 v0.5）；镜像自身修订从第三位递增（0.5.1、0.5.2…），网关升版则前两位跟随
-> 更新时间：2026-09-09
+> 更新时间：2026-09-12
 
 网关运行在每个用户的 DSH 工作台容器内，监听容器 `0.0.0.0:8090`，是业务后端（kitsume）操作工作台的唯一入口。业务方不直接接触 dsh CLI。
 
@@ -62,8 +62,8 @@ X-GW-Token: <gwToken>
 ```json
 {
   "ok": true,
-  "dsh": "0.1.2-rc.1",
-  "version": "gateway/0.3",
+  "dsh": "0.1.5-rc.1",
+  "version": "gateway/1.3",
   "jobs": 0
 }
 ```
@@ -488,3 +488,4 @@ run 记录：`{id(网关任务id), at, status(done/failed/timeout/running), erro
 | gateway/1.0 | 1.0.0 | DeepSeek 凭证管理（/credentials/deepseek，不返回明文）、统一插件视图（/plugins）；生产镜像首次发布 |
 | gateway/1.1 | 1.1.0 | `/task/{id}/stream` SSE 真流式（`answer` / `thinking` / `log` / `done`），正文与思考分道下发，支持打字机与可折叠思考块 |
 | gateway/1.2 | 1.2.0 | **会话管理**：`/sessions` 列表/新建/删除 + `/sessions/{id}` 记录回看；`/chat` 新增 `sessionId`（同会话只发新消息，历史由 dsh 内核按 sessionId 承接，不再全量重发）。**修复推理未生效**：`reasoning` 值域对齐 provider（off/low/high/max），并真正经 `initialize.reasoningEffort` / patch `agent-default-model` 下发，此前只是提示词等级、深度思考块恒为空 |
+| gateway/1.3 | 1.3.0 | 镜像 `0.6.13`：内核升级 `@deepseek-ai/dsh 0.1.2-rc.1 → 0.1.5-rc.1`。**修复「cannot create effect on inactive context」**：`--patch` 覆盖 `agent-default-model` 时 `provider`/`model` 均为必填，原逻辑仅在 `settings.model` 非空时才写 provider，导致「默认设置（model/provider 空串 + reasoning=high）」生成 `config:{reasoningEffort}` → 插件树加载失败 → cordis 判死 fiber → sdk profile 残余插件 `ctx.effect()` 抛 `INACTIVE_EFFECT` 且前端无正文。现改为发 patch 前双双补齐内核默认值，并在 `normalizeSettings` 中把空串归一为 `null` |
