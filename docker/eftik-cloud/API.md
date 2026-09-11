@@ -114,7 +114,7 @@ X-GW-Token: <gwToken>
 | `model` | string | `""`（内核默认 `deepseek-v4-flash`） | 大模型名称，如 `deepseek-v4-flash`。通过 `--patch` 覆盖内核 `agent-default-model` 插件 |
 | `provider` | string | `""`（即 `deepseek-official`） | 模型提供方，一般不填 |
 | `permissionMode` | enum | `workspace-write` | 权限档位（官方原生预设，sandbox + 审批策略联动）：<br>`read-only` 只读沙箱，不可写文件不可执行写操作<br>`workspace-write` 可读写工作区、执行命令（默认）<br>`danger-full-access` 全权访问 + 免审批自动执行（产品模式下用户锁定，不可选） |
-| `reasoning` | enum | `balanced` | 推理等级 `low` / `balanced` / `high`。注：内核 0.1.2-rc.1 无原生推理等级配置，当前以系统前导指令模拟，上游支持后切换为真实配置 |
+| `reasoning` | enum | `high` | 推理强度 `off` / `low` / `high` / `max`（与 dsh `llm-deepseek` provider 的 `reasoningEffort` 值域一致，可由 `GW_PRESET_REASONING` 预设）。**真实生效**：SDK profile 经 `initialize.reasoningEffort` 下发，headless profile 经 patch `agent-default-model.config.reasoningEffort` 下发。`off` 关闭思考（此时不产出 `thinking` 事件）。旧值 `balanced` 读盘时自动映射为 `high` |
 | `background` | string ≤32KB | `""`（可由 `GW_PRESET_BACKGROUND` 预设） | 角色背景/人设，每次任务前注入 `<system-context>`。产品模式仅平台可读写 |
 | `memory` | string ≤32KB | `""`（可由 `GW_PRESET_MEMORY` 预设） | 长期记忆（事实、偏好），注入方式同上。产品模式仅平台可读写 |
 
@@ -157,19 +157,86 @@ curl -X POST https://<工作台地址>/settings \
 
 ---
 
+## 3.5 会话（gateway/1.2）
+
+一次「会话」= 一条连续对话线程。**会话元信息由网关记账**（落 `GW_SESSIONS_PATH`，默认 `/home/node/.dsh/eftik-sessions.json`），**上下文由 dsh 内核按 `sessionId` 维护**。
+
+> 为什么要网关自己记账：dsh SDK 协议只有 `initialize` / `session/prompt` / `shutdown` 三个方法，既没有「列会话」也没有「删会话」，内核的会话存储不对外暴露。所以网关另存一份元信息（标题/时间/消息数/消息正文），既能给业务方做会话列表，也能做记录回看。
+
+### GET /sessions
+
+会话列表，按 `updatedAt` 倒序。
+
+```json
+{
+  "sessions": [
+    {
+      "id": "s-m1k2x9-a7f3d2",
+      "title": "帮我写一个 Python 脚本批量重命名文件…",
+      "createdAt": 1788620082854,
+      "updatedAt": 1788620100000,
+      "messageCount": 4,
+      "preview": "好的，这是一个批量重命名脚本…"
+    }
+  ]
+}
+```
+
+### POST /sessions
+
+新建会话。会话真正产生上下文是在首次 `/chat` 带该 `sessionId` 时（dsh 惰性创建）。
+
+**请求体（可选）**
+
+```json
+{ "title": "自定义标题（省略则由首条消息自动生成）" }
+```
+
+**返回（200）**：`{ "id", "title", "createdAt" }`
+
+### GET /sessions/{id}
+
+单个会话的全部消息（正序），供「查看会话记录」。
+
+```json
+{
+  "id": "s-m1k2x9-a7f3d2",
+  "title": "帮我写一个 Python 脚本…",
+  "createdAt": 1788620082854,
+  "updatedAt": 1788620100000,
+  "messages": [
+    { "role": "user", "content": "帮我写一个脚本", "createdAt": 1788620082854 },
+    { "role": "assistant", "content": "好的，这是脚本…", "createdAt": 1788620090000 }
+  ]
+}
+```
+
+### DELETE /sessions/{id}
+
+删除会话记录，并终止其正在运行的任务。
+
+**删除语义（重要）**：dsh 内核内存里那份 `sessionId` 对应的上下文**无法显式销毁**（SDK 无该协议）。本接口删的是网关侧的记账。由于被删除的 `sessionId` 不会再被使用，那份内核上下文不会再被引用，随容器重启自然回收。对用户而言效果等同于删除。
+
+**返回（200）**：`{ "ok": true }`；不存在返回 404。
+
+---
+
 ## 4. 任务
 
 ### POST /chat
 
 提交一个 agent 任务。
 
-**请求体（二选一）**
+**请求体（三选一）**
 
 ```jsonc
 // 方式一：完整任务文本（适合一次性指令）
 { "task": "在 /workspace 写一个 hello.py 并运行验证" }
 
-// 方式二：消息 + 会话历史（适合多轮对话，历史由业务后端持久化裁剪后传入，建议 ≤20 条）
+// 方式二：会话续聊（推荐，gateway/1.2+）——只发本条消息，历史由 dsh 内核承接
+{ "message": "刚才写的脚本跑通了吗？", "sessionId": "s-m1k2x9-a7f3d2" }
+
+// 方式三：旧式全量历史（无 sessionId 时兼容保留；历史由业务后端持久化裁剪后传入，建议 ≤20 条）
 {
   "message": "刚才写的脚本跑通了吗？",
   "history": [
@@ -179,22 +246,29 @@ curl -X POST https://<工作台地址>/settings \
 }
 ```
 
-> 提交时的 `settings` 快照会应用到该任务（模型、权限、背景等）。
+> **`sessionId` 的存在与否决定上下文怎么来**：
+> - **带 `sessionId`**：dsh 内核按该 id 自己记着上文，网关**只把本条消息**拼上系统前导发过去。prompt 长度不随对话轮数增长，也避免了「每次提问重发全部历史」的浪费。
+> - **不带 `sessionId`**：退回旧行为，由调用方传 `history` 全量拼接。
+>
+> 提交时的 `settings` 快照会应用到该任务（模型、权限、推理强度、背景等）。
 
 **可选字段**
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `task` | string | 完整任务文本（与 `message`/`history` 二选一） |
-| `message` | string | 本条用户消息，与 `history` 拼装为任务 |
-| `history` | array | 会话历史（业务侧持久化裁剪后传入） |
+| `task` | string | 完整任务文本（与 `message` 二选一） |
+| `message` | string | 本条用户消息 |
+| `sessionId` | string | 会话 id。给出时本轮消息会记入该会话（不存在则自动建），并且只发本条消息 |
+| `history` | array | 全量会话历史（**仅在不带 `sessionId` 时生效**） |
 | `profile` | string | 覆盖 dsh profile：`"headless"` 强制一次性输出（无逐字流式）。默认走 `sdk` 真流式 |
 
 **返回（200）**
 
 ```json
-{ "task_id": "t-1788620082854-ioocuv" }
+{ "task_id": "t-1788620082854-ioocuv", "session_id": "s-m1k2x9-a7f3d2" }
 ```
+
+`session_id` 在不带该字段提交时为 `null`。
 
 **错误**：400（无 task 且无 message / 拼装后超 20 万字符 / JSON 非法）
 
@@ -249,7 +323,7 @@ data: {"status":"done","reply":"好的，我来写一个。","error":"","elapsed
 | 事件 | 含义 |
 |------|------|
 | `answer` | **正文增量**：SDK `session.event` → `assistant/chunk` 中 `chunk.type === "text-delta"` 的 `chunk.text`，原样下发，前端累加即得打字机效果。完整正文 = 所有 answer 的 `text` 按序拼接（与 `done.reply` 一致） |
-| `thinking` | **思考增量**：同一路径下 `chunk.type === "reasoning-delta"` 的 `chunk.text`，剥离标签后下发（ANSI 已清除）。无 reasoning 的模型不会有该事件 |
+| `thinking` | **思考增量**：同一路径下 `chunk.type === "reasoning-delta"` 的 `chunk.text`，剥离标签后下发（ANSI 已清除）。仅在 `settings.reasoning` 非 `off` 且所选模型支持思考时才产出 |
 | `log` | 运行日志行（工具调用 `tool/start`/`tool/end`、`step/start`、`turn/start` 等），可展示为"正在干活"动态 |
 | `done` | 终态，携带 `reply`/`error`/`elapsed_ms`/`usage`，随后服务端关闭连接 |
 
@@ -411,3 +485,6 @@ run 记录：`{id(网关任务id), at, status(done/failed/timeout/running), erro
 | gateway/0.7 | 0.6.2 | 工作区容量：GET /storage 返回 /workspace 挂载点 statfs 统计（usedBytes/totalBytes/freeBytes/usedPct），供小程序与中台展示存储用量 |
 | gateway/0.8 | 0.6.3 | 修复空工作区已用虚高：usedBytes 改为递归统计 /workspace 实际文件大小（du 语义），totalBytes/freeBytes 仍取 statfs PVC 配额；共享存储池上 statfs used 会计入同盘其他数据 |
 | gateway/0.9 | 0.6.4 | 技能与定时任务：/skills、/tasks CRUD + 网关内置 30s 调度器（interval/daily/weekly）、手动触发与执行记录；已启用技能注入系统前导，/chat 支持 skillId |
+| gateway/1.0 | 1.0.0 | DeepSeek 凭证管理（/credentials/deepseek，不返回明文）、统一插件视图（/plugins）；生产镜像首次发布 |
+| gateway/1.1 | 1.1.0 | `/task/{id}/stream` SSE 真流式（`answer` / `thinking` / `log` / `done`），正文与思考分道下发，支持打字机与可折叠思考块 |
+| gateway/1.2 | 1.2.0 | **会话管理**：`/sessions` 列表/新建/删除 + `/sessions/{id}` 记录回看；`/chat` 新增 `sessionId`（同会话只发新消息，历史由 dsh 内核按 sessionId 承接，不再全量重发）。**修复推理未生效**：`reasoning` 值域对齐 provider（off/low/high/max），并真正经 `initialize.reasoningEffort` / patch `agent-default-model` 下发，此前只是提示词等级、深度思考块恒为空 |

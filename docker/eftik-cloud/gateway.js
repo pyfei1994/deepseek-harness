@@ -86,7 +86,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/1.1";
+const GATEWAY_VERSION = "gateway/1.2";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -104,6 +104,7 @@ const SETTINGS_PATH = process.env.GW_SETTINGS_PATH || "/home/node/.dsh/eftik-set
 const LEGACY_SETTINGS_PATH = "/workspace/.eftik-settings.json";
 const SKILLS_PATH = process.env.GW_SKILLS_PATH || "/home/node/.dsh/eftik-skills.json";
 const TASKS_PATH = process.env.GW_TASKS_PATH || "/home/node/.dsh/eftik-tasks.json";
+const SESSIONS_PATH = process.env.GW_SESSIONS_PATH || "/home/node/.dsh/eftik-sessions.json";
 const CREDENTIALS_PATH = process.env.GW_CREDENTIALS_PATH || "/home/node/.dsh/.credentials.yaml";
 const WEB_PASSWORD_PATH = process.env.GW_WEB_PASSWORD_PATH || "/home/node/.dsh/eftik-web-password.sha256";
 const DSH_HOME = process.env.DSH_HOME || "/home/node/.dsh";
@@ -113,7 +114,12 @@ const MAX_EVENTS = 200;
 const MAX_HISTORY = 20;
 const MAX_DOWNLOAD_BYTES = Number(process.env.GW_MAX_DOWNLOAD_MB || 200) * 1024 * 1024;
 const PERMISSION_MODES = ["read-only", "workspace-write", "danger-full-access"];
-const REASONING_LEVELS = ["low", "balanced", "high"];
+// 与 dsh「llm-deepseek」provider 的 reasoningEffort 值域对齐（off/low/high/max）。
+// 旧值域 low|balanced|high 是纯提示词等级，从未真正开启 provider 推理，
+// 导致 reasoning-delta 不产出、前端深度思考块为空壳。
+const REASONING_LEVELS = ["off", "low", "high", "max"];
+// 旧值 → 新值映射，保证已存在的 settings.json 平滑升级
+const REASONING_ALIASES = Object.freeze({ balanced: "high", minimal: "low", none: "off" });
 const MAX_TEXT = 32768;
 let pluginOperation = false;
 
@@ -223,7 +229,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   model: "",                    // 空 = 内核默认（deepseek-v4-flash）
   provider: "",                 // 空 = deepseek-official
   permissionMode: process.env.DSH_PERMISSION_MODE || "workspace-write",
-  reasoning: "balanced",
+  reasoning: process.env.GW_PRESET_REASONING || "high",
   background: process.env.GW_PRESET_BACKGROUND || "",
   memory: process.env.GW_PRESET_MEMORY || "",
 });
@@ -248,12 +254,12 @@ function enqueue(fn) {
 function loadSettings() {
   try {
     const raw = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf8"));
-    return { ...DEFAULT_SETTINGS, ...raw };
+    return normalizeSettings({ ...DEFAULT_SETTINGS, ...raw });
   } catch {
     // 旧版设置在 /workspace/.eftik-settings.json：迁移到新路径（workspace 之外）
     try {
       const legacy = JSON.parse(fs.readFileSync(LEGACY_SETTINGS_PATH, "utf8"));
-      const merged = { ...DEFAULT_SETTINGS, ...legacy };
+      const merged = normalizeSettings({ ...DEFAULT_SETTINGS, ...legacy });
       saveSettings(merged);
       try { fs.unlinkSync(LEGACY_SETTINGS_PATH); } catch {}
       return merged;
@@ -261,6 +267,13 @@ function loadSettings() {
       return { ...DEFAULT_SETTINGS };
     }
   }
+}
+
+/** 老库里的 reasoning 可能还是 balanced 等旧值域，读盘时就地升级为新值域 */
+function normalizeSettings(s) {
+  const alias = REASONING_ALIASES[s.reasoning];
+  if (alias) s.reasoning = alias;
+  return s;
 }
 
 function saveSettings(s) {
@@ -308,7 +321,84 @@ const saveSkills = (s) => saveJsonFile(SKILLS_PATH, s);
 const loadTasks = () => loadJsonFile(TASKS_PATH, { tasks: [] });
 const saveTasks = (t) => saveJsonFile(TASKS_PATH, t);
 
+/* ---------- 会话（v1.2）----------
+
+   一次「会话」= 一条连续对话线程。网关自己记账，不依赖 dsh 的会话存储：
+   dsh SDK 协议只有 initialize / session/prompt / shutdown 三个方法，既没有
+   列会话也没有删会话，所以会话元信息（标题、时间、消息数）由网关落 JSON，
+   正文由 dsh 内核按 sessionId 在进程内存里维护。
+
+   关键收益：同一会话内多轮提问只发「新消息」，不再把历史全量拼进 prompt；
+   上下文由 dsh 的 sessionId 承载。切会话 = 换 sessionId。
+*/
+const loadSessions = () => loadJsonFile(SESSIONS_PATH, { sessions: [] });
+const saveSessions = (s) => saveJsonFile(SESSIONS_PATH, s);
+
 const newId = (prefix) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+/** 单会话消息条数上限，超出丢弃最旧的（防止 JSON 无界增长） */
+const MAX_SESSION_MESSAGES = 200;
+/** 会话标题截断长度 */
+const MAX_TITLE_LEN = 40;
+
+/** 由首条用户消息生成会话标题 */
+function deriveTitle(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  if (!t) return "新会话";
+  return t.length > MAX_TITLE_LEN ? t.slice(0, MAX_TITLE_LEN) + "…" : t;
+}
+
+/** 建会话（不落盘，调用方负责 saveSessions） */
+function newSession(title) {
+  const now = Date.now();
+  return {
+    id: newId("s"),
+    title: title || "新会话",
+    createdAt: now,
+    updatedAt: now,
+    messageCount: 0,
+    messages: [],   // [{role,content,createdAt}]，仅用于列表页预览与记录回看
+  };
+}
+
+function findSession(store, id) {
+  return (store.sessions || []).find((s) => s.id === id) || null;
+}
+
+/** 追加一条消息到会话（就地修改，调用方负责 saveSessions） */
+function appendSessionMessage(session, role, content) {
+  if (!session) return;
+  session.messages.push({ role, content: String(content || ""), createdAt: Date.now() });
+  if (session.messages.length > MAX_SESSION_MESSAGES) {
+    session.messages.splice(0, session.messages.length - MAX_SESSION_MESSAGES);
+  }
+  session.messageCount = session.messages.length;
+  session.updatedAt = Date.now();
+  if (session.title === "新会话" && role === "user") {
+    session.title = deriveTitle(content);
+  }
+}
+
+/** 任务终态时把 assistant 回复写进会话记录（列表页预览 / 记录回看用）。
+ *  幂等：SDK 的 turn/end 与进程 close 都会调到，若会话尾条已是同一内容则跳过。 */
+function recordSessionReply(job) {
+  if (!job || !job.sessionId) return;
+  const reply = String(job.reply || "").trim();
+  if (!reply) return;
+  try {
+    const store = loadSessions();
+    const session = findSession(store, job.sessionId);
+    if (!session) return;
+    const msgs = session.messages || [];
+    const last = msgs.length ? msgs[msgs.length - 1] : null;
+    if (last && last.role === "assistant" && String(last.content || "").trim() === reply) return;
+    appendSessionMessage(session, "assistant", reply);
+    saveSessions(store);
+  } catch (e) {
+    // 会话记账失败不应影响对话本身
+    console.warn(`[gw] recordSessionReply failed: ${e.message || e}`);
+  }
+}
 
 function validateSkill(b) {
   const errors = [];
@@ -523,7 +613,9 @@ function buildSystemPreamble(s) {
   const parts = [];
   if (s.background) parts.push(`【角色背景】\n${s.background}`);
   if (s.memory) parts.push(`【长期记忆】\n${s.memory}`);
-  if (s.reasoning === "high") parts.push("【回答要求】先深入思考再作答，重视推理过程与边界情况。");
+  // 推理强度已通过 provider 参数真实生效（见 initialize / patch 两处），
+  // 这里只补一句体感提示，避免与模型自身的推理行为重复约束。
+  if (s.reasoning === "max") parts.push("【回答要求】这是复杂任务，先充分推理再作答，重视边界情况与方案权衡。");
   else if (s.reasoning === "low") parts.push("【回答要求】直接简洁地回答，跳过冗长解释。");
   // 已启用技能：作为能力指引注入，任务需求匹配时模型按技能说明行事
   const enabled = (loadSkills().skills || []).filter((k) => k.enabled && k.prompt);
@@ -548,6 +640,15 @@ function composeTask(body, settings) {
       + `<skill-prompt>\n${skill.prompt}\n</skill-prompt>\n\n${base}`;
   }
   if (body.task) return buildSystemPreamble(settings) + body.task;
+
+  // 带 sessionId：这是同一会话内的后续轮次，dsh 内核按 sessionId 自己记着
+  // 上文，不需要（也不应该）再把历史全量拼进 prompt。只发人设前导 + 新消息，
+  // 前导本身很短，不会随对话轮数膨胀。
+  if (body.sessionId) {
+    return buildSystemPreamble(settings) + body.message;
+  }
+
+  // 无 sessionId（一次性任务 / 兼容旧调用）：退回全量 history 拼接
   const history = Array.isArray(body.history) ? body.history.slice(-MAX_HISTORY) : [];
   const lines = [buildSystemPreamble(settings), "以下是本次对话的历史记录，请基于它保持上下文连贯：", "<history>"];
   for (const m of history) {
@@ -563,7 +664,7 @@ function composeTask(body, settings) {
 /* ---------- 执行 ---------- */
 
 /** 任务对象工厂：统一带上增量流缓冲字段（stream/seq/waiters） */
-function newJob(id, task, settings, source) {
+function newJob(id, task, settings, source, sessionId) {
   const job = {
     id, task, settings,
     status: "queued", reply: "", error: "", events: [], createdAt: Date.now(),
@@ -573,6 +674,8 @@ function newJob(id, task, settings, source) {
     // 执行 profile：sdk = 逐字流式（默认，打字机效果），headless = 一次性输出。
     // 单次任务可通过 settings.stream=false 或 body.profile 覆盖，便于排障回退。
     dshProfile: resolveProfile(settings),
+    // 会话 id：SDK profile 下作为 dsh 的 sessionId 复用，让内核自己承接上下文
+    sessionId: sessionId || null,
   };
   if (source) job.source = source;
   return job;
@@ -718,6 +821,7 @@ function handleSdkLine(job, line) {
       job.status = "done";
       job.reply = (job.reply || "").trim();
       job.finishedAt = Date.now();
+      recordSessionReply(job);
       flushStream(job);
     }
     // 优雅收尾：先发 shutdown，再兜底 SIGKILL（SDK 会 dispose 整棵运行时后退出）
@@ -752,16 +856,22 @@ function handleSdkStdout(job, child) {
   // session/prompt 又要求已 initialize —— 所以等 initialize 的 JSON-RPC 响应回来再下发 prompt。
   const provider = job.settings.provider || "deepseek-official";
   const model = job.settings.model || "deepseek-chat";
-  const sessionId = "task-" + job.id;
+  // sessionId 决定上下文是否续接：带会话的请求复用同一 id，dsh 内核在
+  // 进程内存里按 id 保存该会话的上下文；一次性任务才退回 task-{id}。
+  const sessionId = job.sdkSessionId || job.sessionId || ("task-" + job.id);
   const send = (obj) => {
     try { child.stdin.write(JSON.stringify(obj) + "\n"); } catch {}
   };
 
   job.sdkSend = send;
-  send({
-    jsonrpc: "2.0", id: 1, method: "initialize",
-    params: { cwd: WORKDIR, provider, model },
-  });
+  const initParams = { cwd: WORKDIR, provider, model };
+  // reasoningEffort 必须走 initialize 下发：SDK 协议只有 initialize /
+  // session/prompt / shutdown 三个方法，没有 session/setConfig，因此推理强度
+  // 只能在会话建立前定好。缺省时 dsh 会用 provider 默认值（deepseek = high），
+  // 但显式传值才能保证 reasoning-delta 一定产出、前端深度思考块有内容。
+  const effort = job.settings.reasoning;
+  if (effort && effort !== "off") initParams.reasoningEffort = effort;
+  send({ jsonrpc: "2.0", id: 1, method: "initialize", params: initParams });
   // initialize 的响应由 handleSdkLine 识别（id=1 且无 error）后触发 prompt
   job.sdkSessionId = sessionId;
 }
@@ -804,9 +914,18 @@ function runDsh(job) {
     // 会以 "must be a top-level YAML array of loader patch entries" 直接退出。
     // 这里用 JSON 写（YAML 1.2 是 JSON 超集，dsh 的解析器照常接受），顺带省掉手写转义。
     const patchEntries = [];
+    // 模型 + 推理强度一起进 agent-default-model patch：headless profile 走
+    // dsh 的 patch 机制而不是 SDK initialize，两处都要带 reasoningEffort，
+    // 否则 headless 模式下同样拿不到 reasoning-delta。
+    const modelCfg = {};
     if (job.settings.model) {
-      const provider = job.settings.provider || "deepseek-official";
-      patchEntries.push({ id: "agent-default-model", config: { provider, model: job.settings.model } });
+      modelCfg.provider = job.settings.provider || "deepseek-official";
+      modelCfg.model = job.settings.model;
+    }
+    const effort = job.settings.reasoning;
+    if (effort && effort !== "off") modelCfg.reasoningEffort = effort;
+    if (Object.keys(modelCfg).length) {
+      patchEntries.push({ id: "agent-default-model", config: modelCfg });
     }
     if (profile === "headless") {
       patchEntries.push({
@@ -896,6 +1015,9 @@ function runDsh(job) {
         job.error = job.error || `dsh 退出码 ${code}: ${(stderrTail || stdout).slice(-500)}`;
       }
       job.finishedAt = Date.now();
+      // 兜底记账：SDK profile 的 turn/end 已记过一次，这里用「已存在同内容尾条」幂等，
+      // 避免正常路径重复写入；headless / 异常退出路径则靠这里补记。
+      recordSessionReply(job);
       // 增量流收尾：唤醒订阅方，让它立刻看到终态（不必等下一次轮询）
       flushStream(job);
       resolve();
@@ -1220,16 +1342,97 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    /* ---------- 会话 ---------- */
+    // 会话元信息由网关落盘（dsh SDK 无会话列举/删除协议），正文上下文由 dsh 内核
+    // 按 sessionId 维护。列表按 updatedAt 倒序，附带消息数与末条预览，供小程序渲染。
+    if (req.method === "GET" && url.pathname === "/sessions") {
+      const store = loadSessions();
+      const list = (store.sessions || [])
+        .slice()
+        .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+        .map((s) => {
+          const last = s.messages && s.messages.length ? s.messages[s.messages.length - 1] : null;
+          return {
+            id: s.id,
+            title: s.title,
+            createdAt: s.createdAt,
+            updatedAt: s.updatedAt,
+            messageCount: s.messageCount || (s.messages ? s.messages.length : 0),
+            preview: last ? String(last.content || "").slice(0, 80) : "",
+          };
+        });
+      return send(res, 200, { sessions: list });
+    }
+
+    if (req.method === "POST" && url.pathname === "/sessions") {
+      const body = await readBody(req);
+      const store = loadSessions();
+      const session = newSession(typeof body.title === "string" ? body.title : "");
+      store.sessions = store.sessions || [];
+      store.sessions.push(session);
+      saveSessions(store);
+      return send(res, 200, { id: session.id, title: session.title, createdAt: session.createdAt });
+    }
+
+    const sesm = url.pathname.match(/^\/sessions\/([\w-]+)$/);
+    if (sesm && req.method === "GET") {
+      const store = loadSessions();
+      const session = findSession(store, sesm[1]);
+      if (!session) return send(res, 404, { error: "session not found" });
+      return send(res, 200, {
+        id: session.id,
+        title: session.title,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        messages: session.messages || [],
+      });
+    }
+
+    // 会话删除：dsh SDK 没有删会话协议，内核内存里的上下文无法显式销毁，
+    // 但网关侧的会话记录可以摘掉；下一次同名 sessionId 不会再来，内核那份
+    // 上下文随容器重启自然回收。详见 API.md「删除语义」。
+    if (sesm && req.method === "DELETE") {
+      const store = loadSessions();
+      const before = (store.sessions || []).length;
+      store.sessions = (store.sessions || []).filter((s) => s.id !== sesm[1]);
+      if (store.sessions.length === before) return send(res, 404, { error: "session not found" });
+      saveSessions(store);
+      // 顺带清掉该会话正在跑的任务（若有）
+      for (const job of jobs.values()) {
+        if (job.sessionId === sesm[1] && job.status === "running") {
+          try { job.child && job.child.kill("SIGKILL"); } catch {}
+        }
+      }
+      return send(res, 200, { ok: true });
+    }
+
     /* ---------- 任务 ---------- */
     if (req.method === "POST" && url.pathname === "/chat") {
       const body = await readBody(req, 2 << 20);
       const settings = loadSettings(); // 提交时刻的设置快照
+
+      // sessionId 给出时：无则新建会话，有则续上（并把本轮消息记进会话记录）
+      let sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId.trim() : null;
+      let sessionStore = null;
+      if (sessionId) {
+        sessionStore = loadSessions();
+        let session = findSession(sessionStore, sessionId);
+        if (!session) {
+          session = newSession("");
+          session.id = sessionId;
+          sessionStore.sessions = sessionStore.sessions || [];
+          sessionStore.sessions.push(session);
+        }
+        appendSessionMessage(session, "user", body.message);
+        saveSessions(sessionStore);
+      }
+
       const task = composeTask(body, settings);
       if (!task || typeof task !== "string" || task.length > 200000) {
         return send(res, 400, { error: "task 或 message 必填（拼装后 ≤200000 字符）" });
       }
       const id = `t-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const job = newJob(id, task, settings);
+      const job = newJob(id, task, settings, null, sessionId);
       // 单次任务覆盖执行 profile（排障用；缺省走 settings.stream 决定的 sdk）
       if (body.profile === "headless") job.dshProfile = "headless";
       jobs.set(id, job);
@@ -1238,7 +1441,7 @@ const server = http.createServer(async (req, res) => {
         job.status = "running";
         return runDsh(job);
       });
-      return send(res, 200, { task_id: id });
+      return send(res, 200, { task_id: id, session_id: sessionId });
     }
 
     const m = url.pathname.match(/^\/task\/([\w-]+)$/);
