@@ -698,7 +698,12 @@ function composeTask(body, settings) {
     return buildSystemPreamble(settings) + body.message;
   }
 
-  // 无 sessionId（一次性任务 / 兼容旧调用）：退回全量 history 拼接
+  // 无 sessionId（一次性任务 / 兼容旧调用）：退回全量 history 拼接。
+  // ⚠️ 只有「调用方自己管理上下文」时才该走这里。若调用方是「多会话式」前端，
+  //    新会话首轮**绝不能**带 history —— 那条 history 往往是它从自己库里捞的
+  //    「该用户最近 N 条消息」，不区分会话，会把别的对话内容串进新会话
+  //    （2026-09-13 实测：新建会话问「Java 里怎么调 API」，模型却在讲上一轮的内容；
+  //    第二问因为带上了 sessionId 反而正常）。多会话场景请让网关生成 sessionId。
   const history = Array.isArray(body.history) ? body.history.slice(-MAX_HISTORY) : [];
   const lines = [buildSystemPreamble(settings), "以下是本次对话的历史记录，请基于它保持上下文连贯：", "<history>"];
   for (const m of history) {
