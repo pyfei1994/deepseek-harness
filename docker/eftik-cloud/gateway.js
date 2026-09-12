@@ -1691,11 +1691,19 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req, 2 << 20);
       const settings = loadSettings(); // 提交时刻的设置快照
 
-      // sessionId 给出时：无则新建会话，有则续上（并把本轮消息记进会话记录）
+      // sessionId 处理：
+      //   给出时 → 无则新建会话，有则续上（并把本轮消息记进会话记录）；
+      //   未给出时 → 这里自动补一个，否则会话记录根本不会产生（/sessions 永远为空），
+      //             且内核会退化成 "task-<id>" 一次性上下文，多轮对话丢上下文。
+      //             兼容旧调用方（不传 sessionId 的老前端/一次性任务）：行为不变，
+      //             只是首轮之后前端能拿到 session_id 并续用。
       let sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId.trim() : null;
-      let sessionStore = null;
+      if (!sessionId && !body.task) {
+        // body.task 是一次性任务（无对话语义），不建会话；有 message 才视为对话
+        sessionId = newId("s");
+      }
       if (sessionId) {
-        sessionStore = loadSessions();
+        const sessionStore = loadSessions();
         let session = findSession(sessionStore, sessionId);
         if (!session) {
           session = newSession("");
