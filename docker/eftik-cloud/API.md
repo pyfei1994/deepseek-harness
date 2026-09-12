@@ -1,6 +1,6 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:0.6.15`（网关 `gateway/1.5`，内核 `@deepseek-ai/dsh 0.1.5-rc.1`）
+> 适用版本：镜像 `eftik-dsh-cloud:0.6.16`（网关 `gateway/1.6`，内核 `@deepseek-ai/dsh 0.1.5-rc.2`）
 >
 > 镜像 tag 自 0.5.0 起与网关版本对齐（0.5.0 = 网关 v0.5）；镜像自身修订从第三位递增（0.5.1、0.5.2…），网关升版则前两位跟随
 > 更新时间：2026-09-12
@@ -63,7 +63,7 @@ X-GW-Token: <gwToken>
 {
   "ok": true,
   "dsh": "0.1.5-rc.1",
-  "version": "gateway/1.5",
+  "version": "gateway/1.6",
   "jobs": 0
 }
 ```
@@ -491,3 +491,4 @@ run 记录：`{id(网关任务id), at, status(done/failed/timeout/running), erro
 | gateway/1.3 | 1.3.0 | 镜像 `0.6.13`：内核升级 `@deepseek-ai/dsh 0.1.2-rc.1 → 0.1.5-rc.1`。**修复「cannot create effect on inactive context」**：`--patch` 覆盖 `agent-default-model` 时 `provider`/`model` 均为必填，原逻辑仅在 `settings.model` 非空时才写 provider，导致「默认设置（model/provider 空串 + reasoning=high）」生成 `config:{reasoningEffort}` → 插件树加载失败 → cordis 判死 fiber → sdk profile 残余插件 `ctx.effect()` 抛 `INACTIVE_EFFECT` 且前端无正文。现改为发 patch 前双双补齐内核默认值，并在 `normalizeSettings` 中把空串归一为 `null` |
 | gateway/1.4 | 1.4.0 | 镜像 `0.6.14`：**适配 dsh 0.1.5 的事件结构变更**。① 正文位置从 `message.text` 改为 `message.content[].text`（数组，需筛 `type==="text"`），原实现导致 `reply` 恒为空（「转圈结束但空屏」）；② 新版**取消 `assistant/chunk` 事件**，增量改放 `assistant/message.stream` 的 `text-chunks`/`reasoning-chunks`（`dt[]` 间隔 + `texts[]` 批量），网关新增 `replayAssistantStream` 按 `dt` 缩放回放成打字机增量；③ `turn/end` 新增 `reason` 解析：dsh 在模型失败时（Key 失效/限流/AUTH）不发 JSON-RPC error 而是照常 `turn/end` 并把原因藏在 `data.reason.error`，原实现一律置 `done` 把失败伪装成成功，现按 `reason` 报 `failed` 并透出原始 message；④ 无错误且无正文时不再静默 `done`，明确报错便于诊断 |
 | gateway/1.5 | 1.5.0 | 镜像 `0.6.15`：**修复打字机增量被终态吞掉（竞态）**。`assistant/message`（触发回放定时器）与 `turn/end`（置 `done`）在同一批 stdout 行里前后脚到达，而 `streamTask` 是「读到终态即发 `done` 并 `break`」的模型 —— 它在第一个回放定时器触发前就退出了，实测 SSE 里 `answer`/`thinking` 事件数为 **0**（`done` 却在 1.74s 就到达）。修复：新增 `markJobFinished`，把「终态对订阅方可见的时刻」记为 `settledAt = replayUntil`（回放队列预计跑完时刻）；`job.status` 仍立即置位（HTTP 轮询 `/task/{id}` 不受影响），`streamTask` 与 `waitStream` 只在 `Date.now() >= settledAt` 时才发终态。实测：`count to five` → `answer` 9 条；`sqrt(2) 证明` → `thinking` 81 条 + `answer` 785 条，`done` 严格收尾且仅晚 ~0.1s |
+| gateway/1.6 | 1.6.0 | 镜像 `0.6.16`：内核升级 `@deepseek-ai/dsh 0.1.5-rc.1 → 0.1.5-rc.2`（合并上游 `0.1.5-rc.2` 到 `eftik-cloud`，冲突仅 `.gitignore`，gateway 定制 3493 行完整保留；rc.2 的 `text-chunks`/`reasoning-chunks` 结构与 rc.1 一致，gateway/1.5 的事件适配直接适用）。**修复对话记录恒为空 / 每次进入都是新会话**：原 `POST /chat` 仅在 `body.sessionId` 非空时才落会话记录，未给出时 `sessionStore = null` → `GET /sessions` 永远返回空数组；且同一路径下内核 sessionId 退化为 `task-<id>`，多轮对话实际断链。现改为：未带 sessionId 且是对话请求（有 `message`、非一次性 `task`）时，网关自己生成一个会话 id，正常走记账 + 传给内核 + 随响应回传 `session_id`。配套中台侧 `DshWorkspaceService` 改用 `chatRaw()` 认下回传的 `session_id` 并补写首轮 user 消息归属（原 `chat()` 只取 `task_id` 把 session_id 丢弃）。一次性任务与已有 sessionId 的调用方行为完全不变 |

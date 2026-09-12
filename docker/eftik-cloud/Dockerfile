@@ -7,7 +7,7 @@
 
 FROM node:24-trixie
 
-ARG DSH_VERSION=0.1.5-rc.1
+ARG DSH_VERSION=0.1.5-rc.2
 ARG PNPM_VERSION=10.15.1
 
 # tini：正确的信号转发与子进程回收；git：agent 常用工具链
