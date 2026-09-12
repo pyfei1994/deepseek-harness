@@ -86,7 +86,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/1.6";
+const GATEWAY_VERSION = "gateway/1.7";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -404,6 +404,50 @@ function recordSessionReply(job) {
     // 会话记账失败不应影响对话本身
     console.warn(`[gw] recordSessionReply failed: ${e.message || e}`);
   }
+}
+
+/**
+ * 删除内核磁盘上的一个会话目录，使同名 sessionId 不会被 sdk-session-resume
+ * 插件重新 resume 回来。
+ *
+ * 目录布局（dsh-session-persistence-jsonl，gateway/1.7 实测）：
+ *   <DSH_HOME>/sessions/--workspace--/<sessionId>/session.vox.jsonl.zstd
+ *   <DSH_HOME>/sessions/--workspace--/<sessionId>/session.lock
+ *
+ * ⚠️ 只删「删除」这一个入口。正常对话结束时不能删 —— 那正是 resume 依赖的数据。
+ *
+ * @returns {boolean} 是否确认删掉了（目录本就不存在也算成功，调用方无需重试）
+ */
+function purgeKernelSessionDir(sessionId) {
+  if (!sessionId || typeof sessionId !== "string") return true;
+  // 防目录穿越：sessionId 由网关生成（s-xxxx），只允许安全字符
+  if (!/^[\w-]+$/.test(sessionId)) {
+    console.warn(`[gw] 拒绝删除异常 sessionId: ${sessionId}`);
+    return true;
+  }
+  const home = process.env.DSH_HOME || "/home/node/.dsh";
+  const base = path.join(home, "sessions");
+  let workspaceDirs = [];
+  try {
+    workspaceDirs = fs.readdirSync(base, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => path.join(base, d.name));
+  } catch {
+    return true; // 没有 sessions 目录 = 没有会话可删
+  }
+  let ok = true;
+  for (const wsDir of workspaceDirs) {
+    const target = path.join(wsDir, sessionId);
+    if (!fs.existsSync(target)) continue;
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      console.log(`[gw] 已删除内核会话目录: ${target}`);
+    } catch (e) {
+      ok = false;
+      console.warn(`[gw] 删除内核会话目录失败 ${target}: ${e.message || e}`);
+    }
+  }
+  return ok;
 }
 
 function validateSkill(b) {
@@ -1208,6 +1252,23 @@ function runDsh(job) {
         }],
       });
     }
+    // SDK profile：补上内核缺失的会话 resume 语义。
+    //
+    // 背景：SDK profile 的 createSession(sessionId) 只调 ctx.agents.create()，
+    // 没有 resume 分支；而内核有磁盘持久化，新进程启动会把磁盘会话恢复进内存
+    // store，于是同一 sessionId 第二次创建必抛 `session "..." already exists`。
+    // Web profile 用的 dsh-api-session-controller 有正确的三步判定
+    // （内存 live → 磁盘 observeSession + agents.resume → create），本插件把它
+    // 补到 SDK profile 上。零内核文件改动，纯外挂；上游修好 resume 后删掉即可。
+    // 详见 docker/eftik-cloud/sdk-session-resume.js 顶部注释。
+    if (profile === "sdk") {
+      patchEntries.push({
+        insert: [{
+          id: "eftik-sdk-session-resume",
+          name: "file:///opt/gw/sdk-session-resume.js",
+        }],
+      });
+    }
     const patchPath = `/tmp/patch-${job.id}.yml`;
     fs.writeFileSync(patchPath, JSON.stringify(patchEntries, null, 2));
     args.push("--patch", patchPath);
@@ -1668,9 +1729,15 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // 会话删除：dsh SDK 没有删会话协议，内核内存里的上下文无法显式销毁，
-    // 但网关侧的会话记录可以摘掉；下一次同名 sessionId 不会再来，内核那份
-    // 上下文随容器重启自然回收。详见 API.md「删除语义」。
+    // 会话删除：SDK 协议本身没有删会话方法，需要网关两侧都清：
+    //   ① 网关自己的 JSON 记账（/sessions 列表的数据源）
+    //   ② 内核磁盘上的会话目录 —— gateway/1.7 起必须删，因为创建会话时
+    //      sdk-session-resume 插件会优先 resume 磁盘会话；只删①的话，
+    //      用户删掉会话后新建同 id 会把旧上下文整个捞回来（实测模型会
+    //      正确复述「删除前」约定的内容，等于删除无效）。
+    //   目录：<DSH_HOME>/sessions/--workspace--/<sessionId>/（含 session.vox.jsonl.zstd
+    //   与 session.lock）。若该会话有任务正在跑，任务已在下面被 SIGKILL，
+    //   稍等锁释放后再删；删不掉不视为失败（下轮覆盖写入仍会被 resume 拦下）。
     if (sesm && req.method === "DELETE") {
       const store = loadSessions();
       const before = (store.sessions || []).length;
@@ -1678,11 +1745,26 @@ const server = http.createServer(async (req, res) => {
       if (store.sessions.length === before) return send(res, 404, { error: "session not found" });
       saveSessions(store);
       // 顺带清掉该会话正在跑的任务（若有）
+      let hadRunning = false;
       for (const job of jobs.values()) {
         if (job.sessionId === sesm[1] && job.status === "running") {
+          hadRunning = true;
           try { job.child && job.child.kill("SIGKILL"); } catch {}
         }
       }
+      const purgeKernelSession = () => {
+        const removed = purgeKernelSessionDir(sesm[1]);
+        if (!removed && hadRunning) {
+          // 进程刚被杀，锁可能还没释放：延迟重试一次
+          setTimeout(() => {
+            const again = purgeKernelSessionDir(sesm[1]);
+            if (!again) console.warn(`[dsh-gw] 内核会话目录未能删除: ${sesm[1]}（下一轮不会被 resume）`);
+          }, 1500);
+        } else if (!removed) {
+          console.warn(`[dsh-gw] 内核会话目录不存在或未能删除: ${sesm[1]}`);
+        }
+      };
+      purgeKernelSession();
       return send(res, 200, { ok: true });
     }
 
