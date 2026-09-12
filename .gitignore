@@ -47,3 +47,8 @@ native/system/test/bin/
 docker/demo/workspaces.local.json
 docker/demo/kubeconfig*.yaml
 docker/demo/kubeconfig*.yml
+
+# eftik-cloud 网关本地开发/预览产物
+docker/eftik-cloud/.preview-*.html
+docker/eftik-cloud/.preview-server.cjs
+docker/eftik-cloud/login-*.png

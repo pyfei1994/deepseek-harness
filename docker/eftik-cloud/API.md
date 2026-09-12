@@ -1,6 +1,6 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:0.6.20`（网关 `gateway/1.7`，内核 `@deepseek-ai/dsh 0.1.5-rc.2`）
+> 适用版本：镜像 `eftik-dsh-cloud:0.6.21`（网关 `gateway/1.7`，内核 `@deepseek-ai/dsh 0.1.5-rc.2`）
 >
 > 镜像 tag 自 0.5.0 起与网关版本对齐（0.5.0 = 网关 v0.5）；镜像自身修订从第三位递增（0.5.1、0.5.2…），网关升版则前两位跟随
 > 更新时间：2026-09-13
@@ -154,6 +154,66 @@ curl -X POST https://<工作台地址>/settings \
 ### DELETE /settings
 
 重置为默认值（平台 env 预设保留），返回重置后的设置。
+
+---
+
+## 3.2 WebUI 访问密码（gateway/1.7）
+
+工作台的浏览器入口（容器 8080 端口，`web-ui.js`）默认需要密码。密码**不属于**上文的 `/settings`，而是单独的凭证：
+
+```http
+GET /web-access
+```
+```json
+{ "configured": true }
+```
+
+```http
+PUT /web-access
+Content-Type: application/json
+
+{ "password": "至少8位至多64位" }
+```
+```json
+{ "configured": true }
+```
+
+| 要点 | 说明 |
+|------|------|
+| 落盘位置 | `GW_WEB_PASSWORD_PATH`，默认 `/home/node/.dsh/eftik-web-password.sha256`（**dsh-home PVC 上，workspace 之外**） |
+| 存储形式 | `sha256(明文密码)` 的 hex，**不存明文**；文件权限 `0600` |
+| 校验 | sha256 后恒定时间比较（`crypto.timingSafeEqual`） |
+| 改密码 | 直接再 PUT 一次即可；**所有既有浏览器会话立即失效**（会话 cookie 的签名密钥派生自密码哈希） |
+
+**三种调用方共用同一个 8080 端口**，`web-ui.js` 按凭据形态分流：
+
+| 调用方 | 凭据 | 失败时的响应 |
+|--------|------|-------------|
+| 浏览器（人） | `eftik-session` 签名 Cookie（由登录页 `/_eftik/login` 种下） | `302 /_eftik/login` 或直接返回登录页 HTML |
+| 小程序 / 脚本 / curl | `Authorization: Basic base64("dsh:<密码>")`（用户名任意） | `401 + WWW-Authenticate: Basic realm="DSH Workspace"` |
+| 容器内其它进程 | 走 `/_eftik/api` 前缀直通 8090，**不经此鉴权** | — |
+
+> 判定「是浏览器」靠请求头 `Accept: text/html` 或 `Sec-Fetch-Mode: navigate`；WebSocket 升级请求单独识别（不带 Accept，不会被误判成浏览器导航）。
+
+### 登录页自带接口（`web-ui.js`，非 8090 网关）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/_eftik/login` | 返回登录页 HTML；已登录则 `302 /` |
+| `POST` | `/_eftik/login` | `{password, remember}` → 成功下发 `eftik-session` Cookie；失败 `401`；5 分钟窗口内失败满 10 次返回 `429` |
+| `POST` | `/_eftik/logout` | 清 Cookie |
+| `GET` | `/_eftik/session` | `{configured, authenticated}`，供登录页决定显示「登录」还是「首次设置密码」 |
+| `POST` | `/_eftik/setup` | 首次设置密码（**仅未配置时可用**，已配置返回 `403`，防匿名重置） |
+| `GET` | `/branding/*` | 登录页品牌资源（背景图等），白名单文件名 + 防目录穿越 |
+
+### 换肤（不需要重建镜像）
+
+登录页背景图按顺序探测 PVC 上的 `/home/node/.dsh/branding/bg.{jpg,png,webp,jpeg}`，存在则注入为 `--bg-image`。镜像内 `entrypoint.sh` 会在**PVC 上没有同名文件时**才把 `/opt/gw/branding/` 的出厂图拷过去，所以：
+
+- 想换背景：直接往 PVC 的 `/home/node/.dsh/branding/` 丢一张 `bg.png`，刷新登录页即可（已存在的文件不会被镜像覆盖）
+- 想换配色/文案：改 `login.html` 顶部的 `:root` 变量后重建镜像
+
+> 设计取舍：**刻意不引入 Vue / UI 组件库**。登录页只有「一个密码框 + 一个按钮」，Vue 的响应式、路由、状态管理全用不上，反而要往镜像里塞构建链（node_modules + bundler），每次改个颜色都要重新打包推送 ACR。单文件 HTML（内联 CSS，约 400 行）已经能做到比组件库默认样式更贴合品牌。
 
 ---
 
@@ -512,3 +572,4 @@ run 记录：`{id(网关任务id), at, status(done/failed/timeout/running), erro
 
 > 实测（node mock 按生产行为复刻 + 浏览器 cookie jar 跟随重定向，上限 20 跳）：修复前「带无关 cookie」「带脏 dsh cookie」均 20 跳死循环；修复后四场景全部收敛 —— 无 cookie 2 跳 / 带无关 cookie 2 跳 / 带脏 cookie 2 跳 / 带合法 cookie 1 跳，均 200。生产实测 A、B 两场景均 `303 → 200`（2 跳） |
 | gateway/1.6 | 1.6.0 | 镜像 `0.6.16`：内核升级 `@deepseek-ai/dsh 0.1.5-rc.1 → 0.1.5-rc.2`（合并上游 `0.1.5-rc.2` 到 `eftik-cloud`，冲突仅 `.gitignore`，gateway 定制 3493 行完整保留；rc.2 的 `text-chunks`/`reasoning-chunks` 结构与 rc.1 一致，gateway/1.5 的事件适配直接适用）。**修复对话记录恒为空 / 每次进入都是新会话**：原 `POST /chat` 仅在 `body.sessionId` 非空时才落会话记录，未给出时 `sessionStore = null` → `GET /sessions` 永远返回空数组；且同一路径下内核 sessionId 退化为 `task-<id>`，多轮对话实际断链。现改为：未带 sessionId 且是对话请求（有 `message`、非一次性 `task`）时，网关自己生成一个会话 id，正常走记账 + 传给内核 + 随响应回传 `session_id`。配套中台侧 `DshWorkspaceService` 改用 `chatRaw()` 认下回传的 `session_id` 并补写首轮 user 消息归属（原 `chat()` 只取 `task_id` 把 session_id 丢弃）。一次性任务与已有 sessionId 的调用方行为完全不变 |
+| gateway/1.7 | 1.7.2 | 镜像 `0.6.21`：**工作台登录页改版 —— 用自研品牌登录页替换浏览器原生 Basic Auth 弹框**。背景：原先 `WWW-Authenticate: Basic` 会弹一个无法自定义样式的浏览器原生对话框，与「狐分身」品牌完全不搭。**改造内容**：① 新增 `web-auth.js`（零依赖），实现基于 **HMAC-SHA256 签名 Cookie** 的浏览器会话：cookie 名 `eftik-session`（与上游 dsh 自己的 `dsh-auth-*` 严格区分），值为 `base64url("exp=<毫秒>").<hex签名>`，`HttpOnly + SameSite=Lax`；**签名密钥派生自密码哈希**，因此改密码会自动失效所有旧会话（这是想要的行为）。② 新增 `login.html` 单文件登录页（内联 CSS/JS，**不引入 Vue 或任何 UI 组件库**，无构建链、不增加 npm 依赖）：浅色暖调卡片呼应品牌插画，含登录面板与「首次设置密码」面板，密码显隐切换、记住我（30 天 / 不勾 12 小时）、内联错误提示与抖动动画、移动端自适应。③ `web-ui.js` 新增 `/_eftik/{login,logout,session,setup}` 四个接口与 `GET /branding/*` 静态资源路由，并按调用方形态分流：**浏览器导航** 失败 → `302 /_eftik/login`（或直接返回登录页）；**API 调用** 失败 → 仍回 `401 + WWW-Authenticate`，**小程序 / 脚本 / curl 的 Basic Auth 通道完全不受影响**（三种调用方共存）。④ 登录失败限流：滑动窗口 5 分钟内最多 10 次。⑤ `POST /_eftik/setup` 仅在尚未配置密码时可用，避免已配置后被匿名重置。⑥ 登录页背景图从 PVC 的 `/home/node/.dsh/branding/bg.*` 读取（镜像内置出厂默认，`entrypoint.sh` 只在 PVC 无同名文件时才拷贝，便于运维直接丢图换肤而无需重建镜像）。⑦ 登录页「已登录却回退到登录页」时 `302 /` 直接送进工作台。**注意**：镜像 tag 从 0.6.20 → 0.6.21，但网关协议版本保持 `gateway/1.7`（`/web-access` 等既有接口签名未变）。 |

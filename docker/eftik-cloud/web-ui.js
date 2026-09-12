@@ -1,8 +1,10 @@
 const http = require('http');
 const net = require('net');
 const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const { createWebAuth } = require('./web-auth');
 
 const PUBLIC_PORT = Number(process.env.GW_WEB_PORT || 8080);
 const UPSTREAM_PORT = Number(process.env.GW_WEB_UPSTREAM_PORT || 3080);
@@ -10,9 +12,14 @@ const GATEWAY_PORT = Number(process.env.GW_PORT || 8090);
 const API_PREFIX = '/_eftik/api';
 const PASSWORD_PATH = process.env.GW_WEB_PASSWORD_PATH || '/home/node/.dsh/eftik-web-password.sha256';
 const PLUGIN_RELOAD_PATH = process.env.GW_PLUGIN_RELOAD_PATH || '/home/node/.dsh/eftik-plugin-reload';
+// 登录页与品牌资源：容器内 /opt/gw/ 随镜像发布；背景图放 PVC 便于换肤不重建镜像
+const LOGIN_HTML_PATH = process.env.GW_LOGIN_HTML || path.join(__dirname, 'login.html');
+const BRANDING_DIR = process.env.GW_BRANDING_DIR || '/home/node/.dsh/branding';
 let launchToken = '';
 let web = null;
 let stopping = false;
+
+const auth = createWebAuth({ fs, passwordPath: PASSWORD_PATH });
 
 // dsh web 用「token 换 cookie」鉴权：首次带 ?token=xxx，由它种下 dsh-auth-<随机名>
 // cookie，之后靠 cookie 通行。上游每次拿到「带 token」的请求都会重新种 cookie 并
@@ -28,20 +35,146 @@ function hasDshCookie(req) {
 }
 
 function authorized(req) {
-  let expected = '';
-  try { expected = fs.readFileSync(PASSWORD_PATH, 'utf8').trim(); } catch {}
-  if (!expected) return false;
-  const raw = String(req.headers.authorization || '');
-  if (!raw.startsWith('Basic ')) return false;
-  let password = '';
-  try { password = Buffer.from(raw.slice(6), 'base64').toString('utf8').split(':').slice(1).join(':'); } catch {}
-  const actual = crypto.createHash('sha256').update(password).digest('hex');
-  return expected.length === actual.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(actual));
+  return auth.verifyAny(req);
 }
 
 function challenge(socket) {
   socket.write('HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="DSH Workspace"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
   socket.destroy();
+}
+
+/* ---------- 登录页 / 会话接口 ---------- */
+
+const MAX_LOGIN_ATTEMPTS = 10;      // 滑动窗口内允许的失败次数
+const LOGIN_WINDOW_MS = 5 * 60 * 1000;
+let loginAttempts = [];             // 失败时间戳（单用户容器，无需按 IP 分桶）
+
+function loginRateLimited() {
+  const now = Date.now();
+  loginAttempts = loginAttempts.filter((t) => now - t < LOGIN_WINDOW_MS);
+  return loginAttempts.length >= MAX_LOGIN_ATTEMPTS;
+}
+
+function readJsonBody(req, limit) {
+  return new Promise((resolve) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > (limit || 64 * 1024)) { req.destroy(); resolve(null); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); }
+      catch { resolve(null); }
+    });
+    req.on('error', () => resolve(null));
+  });
+}
+
+function sendJson(res, code, obj, extraHeaders) {
+  const body = Buffer.from(JSON.stringify(obj), 'utf8');
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': body.length, 'Cache-Control': 'no-store', ...(extraHeaders || {}) });
+  res.end(body);
+}
+
+/** 返回登录页 HTML；背景图存在时把 URL 注入进去（无需重建镜像即可换肤） */
+function sendLoginPage(res) {
+  let html;
+  try {
+    html = fs.readFileSync(LOGIN_HTML_PATH, 'utf8');
+  } catch (e) {
+    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('登录页资源缺失，请联系管理员');
+  }
+  // 探测 PVC 上的品牌背景图（任一扩展名），存在才注入 —— 避免 404 导致的白屏闪烁
+  let bgUrl = '';
+  for (const name of ['bg.jpg', 'bg.png', 'bg.webp', 'bg.jpeg']) {
+    try { if (fs.statSync(path.join(BRANDING_DIR, name)).isFile()) { bgUrl = `/branding/${name}`; break; } } catch {}
+  }
+  if (bgUrl) {
+    html = html
+      .replace('--bg-image: none;', `--bg-image: url('${bgUrl}');`)
+      .replace('<body>', '<body class="has-bg">');
+  }
+  const buf = Buffer.from(html, 'utf8');
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': buf.length, 'Cache-Control': 'no-store' });
+  res.end(buf);
+}
+
+/** 提供 /branding/* 静态资源（只允许白名单文件名，防目录穿越） */
+function serveBranding(res, pathname) {
+  const name = pathname.slice('/branding/'.length);
+  if (!/^[\w.-]+$/.test(name)) { res.writeHead(400); return res.end(); }
+  const full = path.join(BRANDING_DIR, name);
+  const types = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.svg': 'image/svg+xml' };
+  const ext = path.extname(full).toLowerCase();
+  if (!types[ext]) { res.writeHead(403); return res.end(); }
+  let data;
+  try { data = fs.readFileSync(full); } catch { res.writeHead(404); return res.end(); }
+  res.writeHead(200, { 'Content-Type': types[ext], 'Content-Length': data.length, 'Cache-Control': 'public, max-age=3600' });
+  res.end(data);
+}
+
+/** 处理 /_eftik/{login,logout,session,setup}；返回 true 表示已接管 */
+async function handleAuthRoutes(req, res, url) {
+  const p = url.pathname;
+
+  if (p === '/_eftik/login' && req.method === 'POST') {
+    if (!auth.isConfigured()) return sendJson(res, 409, { error: '尚未设置访问密码' }), true;
+    if (loginRateLimited()) return sendJson(res, 429, { error: '尝试过于频繁，请稍后再试' }), true;
+    const body = await readJsonBody(req);
+    const password = body && typeof body.password === 'string' ? body.password : '';
+    if (!auth.passwordMatches(password)) {
+      loginAttempts.push(Date.now());
+      return sendJson(res, 401, { error: '密码不正确，请重试' }), true;
+    }
+    loginAttempts = [];
+    const cookie = auth.issueCookie(body.remember !== false);
+    return sendJson(res, 200, { ok: true }, cookie ? { 'Set-Cookie': cookie } : undefined), true;
+  }
+
+  if (p === '/_eftik/logout') {
+    return sendJson(res, 200, { ok: true }, { 'Set-Cookie': auth.clearCookie() }), true;
+  }
+
+  // 前端启动时问一次：是否已配置密码（决定显示登录还是设置密码）
+  if (p === '/_eftik/session' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      configured: auth.isConfigured(),
+      authenticated: auth.verifyBrowser(req),
+    }), true;
+  }
+
+  // 首次设置密码：**仅当尚未配置时可用**，避免已配置后被匿名重置
+  if (p === '/_eftik/setup' && req.method === 'POST') {
+    if (auth.isConfigured()) return sendJson(res, 403, { error: '访问密码已设置，请联系管理员重置' }), true;
+    const body = await readJsonBody(req);
+    const password = body && typeof body.password === 'string' ? body.password : '';
+    if (password.length < 8 || password.length > 64 || /[\r\n]/.test(password)) {
+      return sendJson(res, 400, { error: '密码须为 8-64 个字符' }), true;
+    }
+    try {
+      fs.mkdirSync(path.dirname(PASSWORD_PATH), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(PASSWORD_PATH, crypto.createHash('sha256').update(password).digest('hex'), { mode: 0o600 });
+      try { fs.chmodSync(PASSWORD_PATH, 0o600); } catch {}
+    } catch (e) {
+      return sendJson(res, 500, { error: '写入失败：' + (e && e.message) }), true;
+    }
+    const cookie = auth.issueCookie(true);
+    return sendJson(res, 200, { ok: true }, cookie ? { 'Set-Cookie': cookie } : undefined), true;
+  }
+
+  if (p === '/_eftik/login') {
+    // 已持有效会话却回退到登录页 → 直接送进工作台，避免「登录成功又看到登录页」的困惑
+    if (auth.verifyAny(req)) {
+      res.writeHead(302, { Location: '/', 'Cache-Control': 'no-store' });
+      return res.end(), true;
+    }
+    return sendLoginPage(res), true;
+  }
+
+  return false;
 }
 
 function upstreamHeaders(req) {
@@ -78,7 +211,7 @@ fs.watchFile(PLUGIN_RELOAD_PATH, { interval: 1000 }, (current, previous) => {
   }
 });
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   // 小程序后端与 WebUI 共用一个 Sealos 公网地址。保留前缀转发到容器内网关，
   // X-GW-Token 原样保留；该路径不要求浏览器 Basic Auth。
   if ((req.url || '').startsWith(API_PREFIX)) {
@@ -92,9 +225,45 @@ const server = http.createServer((req, res) => {
     req.pipe(proxy);
     return;
   }
+
+  // 注意：req.url 可能是畸形值（裸代理扫描、OPTIONS *），解析失败时退回 '/'，
+  // 否则这里抛异常会让整个 http server 崩溃。
+  let url;
+  try {
+    url = new URL(req.url || '/', 'http://localhost');
+  } catch {
+    url = new URL('/', 'http://localhost');
+  }
+
+  // 品牌资源（登录页背景图等），从 PVC 读，可换肤不重建镜像
+  if (url.pathname.startsWith('/branding/')) {
+    return serveBranding(res, url.pathname);
+  }
+
+  // 登录/登出/会话状态/首次设置密码
+  if (url.pathname.startsWith('/_eftik/')) {
+    if (await handleAuthRoutes(req, res, url)) return;
+  }
+
+  // 鉴权：浏览器会话 Cookie 或 Basic Auth 任一通过即可。
+  // 失败时按调用方形态分流，避免把 API 调用重定向到登录页：
+  //   浏览器导航 → 302 到 /_eftik/login（或直接渲染登录页）
+  //   其它       → 401 + WWW-Authenticate（保持既有契约，不破坏脚本/小程序）
   if (!authorized(req)) {
+    if (auth.isBrowserRequest(req)) {
+      // 已登录但 cookie 失效的情况用 302 更自然；未配置密码则直接渲染设置页
+      if (!auth.isConfigured() || req.url === '/_eftik/login') return sendLoginPage(res);
+      res.writeHead(302, { Location: '/_eftik/login', 'Cache-Control': 'no-store' });
+      return res.end();
+    }
     res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="DSH Workspace"', 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('请输入工作台访问密码');
+  }
+  // 已通过认证却停在登录页（例如手动回退）→ 直接送进工作台。
+  // 注意：/branding/* 与 /_eftik/* 已在上面被接管，走到这里的只可能是 dsh 自身页面。
+  if (url.pathname === '/_eftik/login') {
+    res.writeHead(302, { Location: '/', 'Cache-Control': 'no-store' });
+    return res.end();
   }
   if (!launchToken) { res.writeHead(503, { 'Retry-After': 2 }); return res.end('DSH WebUI 正在启动'); }
   let target = req.url || '/';
