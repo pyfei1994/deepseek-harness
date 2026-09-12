@@ -3,7 +3,7 @@
 # 面向 API/headless 场景：容器内只跑 in-pod 网关。
 # 构建（context 必须是本目录，COPY 才能找到 gateway.js）：
 # docker build --progress=plain --provenance=false -f docker/eftik-cloud/Dockerfile \
-#   -t registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:0.6.17 docker/eftik-cloud
+#   -t registry.cn-shanghai.aliyuncs.com/eftik/eftik-dsh-cloud:0.6.20 docker/eftik-cloud
 
 FROM node:24-trixie
 
