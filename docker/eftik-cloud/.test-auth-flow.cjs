@@ -106,7 +106,17 @@ function req(opts, body) {
   check("WebSocket 升级 → 非浏览器", auth.isBrowserRequest({ headers: { upgrade: "websocket", accept: "*/*" } }) === false);
 
   console.log("\n[8] 登出清 cookie");
-  check("clearCookie 含 Max-Age=0", /Max-Age=0/.test(auth.clearCookie()));
+  // 详细覆盖在 .test-logout.cjs；这里只做冒烟，确认接口在且语义对
+  const cleared = auth.clearCookies(
+    { headers: { cookie: "eftik-session=x; dsh-auth-y=z" } },
+    { host: "a.example.com" }
+  );
+  check("clearCookies 全部 Max-Age=0", cleared.length > 0 && cleared.every((c) => /Max-Age=0/.test(c)), cleared.join(" | "));
+  check(
+    "clearCookies 覆盖请求里的每个 cookie 名",
+    ["eftik-session", "dsh-auth-y"].every((n) => cleared.some((c) => c.startsWith(n + "="))),
+    cleared.join(" | ")
+  );
 
   console.log("\n[9] 改密码 → 旧 cookie 立即失效");
   const before = cookieVal;

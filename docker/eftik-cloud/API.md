@@ -1,6 +1,6 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:0.6.21`（网关 `gateway/1.7`，内核 `@deepseek-ai/dsh 0.1.5-rc.2`）
+> 适用版本：镜像 `eftik-dsh-cloud:0.6.23`（网关 `gateway/1.8`，内核 `@deepseek-ai/dsh 0.1.5-rc.2`）
 >
 > 镜像 tag 自 0.5.0 起与网关版本对齐（0.5.0 = 网关 v0.5）；镜像自身修订从第三位递增（0.5.1、0.5.2…），网关升版则前两位跟随
 > 更新时间：2026-09-13
@@ -201,10 +201,55 @@ Content-Type: application/json
 |------|------|------|
 | `GET` | `/_eftik/login` | 返回登录页 HTML；已登录则 `302 /` |
 | `POST` | `/_eftik/login` | `{password, remember}` → 成功下发 `eftik-session` Cookie；失败 `401`；5 分钟窗口内失败满 10 次返回 `429` |
-| `POST` | `/_eftik/logout` | 清 Cookie |
+| `GET/POST` | `/_eftik/logout` | 退出登录 / 清除登录缓存，详见下节 |
 | `GET` | `/_eftik/session` | `{configured, authenticated}`，供登录页决定显示「登录」还是「首次设置密码」 |
 | `POST` | `/_eftik/setup` | 首次设置密码（**仅未配置时可用**，已配置返回 `403`，防匿名重置） |
 | `GET` | `/branding/*` | 登录页品牌资源（背景图等），白名单文件名 + 防目录穿越 |
+
+### 退出登录 / 清除登录缓存（`/_eftik/logout`）
+
+用于解决「**打开过同品牌其它子域后本工作台打不开**」这类脏 cookie 问题，也可作为
+「登录页本身都进不去」时的最终兜底。
+
+| 参数 | 作用 |
+|------|------|
+| `?deep=1`（或 body `{deep:true}`） | 顺带**重启上游 `dsh web`**：换掉 launchToken 与内核侧 WebUI 会话。极端卡死时用；代价是页面上正在跑的任务中断 |
+| `?wide=1`（或 body `{wide:true}`） | 连**父域**（如 `.sealosbja.site`）上的同名 cookie 一起清。用于脏 cookie 来自同父域其它应用的场景 |
+
+**响应形态按调用方分流**（与其它接口一致）：
+
+| 调用方 | 响应 |
+|--------|------|
+| 浏览器（`Accept: text/html`） | `302 /_eftik/login?cleared=1`（`wide` 时为 `cleared=reset`），整页跳转后登录页顶部带提示条 |
+| 脚本 / 小程序 | `200 {"ok":true,"deep":…,"wide":…,"cleared":<下发的 Set-Cookie 条数>}` |
+
+**清哪些 cookie**：把请求里**实际出现的每个 cookie 名**逐个置空（`Max-Age=0`），
+外加恒定的 `eftik-session`。每一个名字下发两条 Set-Cookie：
+
+1. 不带 `Domain` → 命中 host-only cookie（我们自己下发的都属于这种）
+2. 带 `Domain=<当前 host>` → 命中显式写了域名的 cookie
+
+> **为什么不写死名字**：`Set-Cookie` 的 `Domain`/`Path` 必须能对上浏览器里那条 cookie 才会生效，
+> 而服务端看不到对方的 `Domain` 属性 —— 只能把浏览器真的发过来的名字全清一遍。
+> 实测脏源既可能是 `dsh web` 重启后失效的 `dsh-auth-*`，也可能是 Sealos 平台自身在父域下发的 cookie，
+> 白名单清不干净。
+>
+> `wide=1` 才会动父域，因为那会**连带清掉同父域其它应用的同名 cookie**，属于有副作用的动作，
+> 必须由用户显式选择（登录页对应的按钮是「重置工作台」）。
+
+**入口有三处**（覆盖「进不去」和「想退出」两种场景）：
+
+| 位置 | 形态 |
+|------|------|
+| 工作台内 | 右下角浮动按钮：`退出登录`（清 cookie）/ `重置工作台`（`deep=1&wide=1`，带二次确认） |
+| 登录页底部 | 「清除本机登录缓存」文字链 |
+| 地址栏 | 直接访问 `/_eftik/logout`（未登录也可用） |
+
+> 工作台浮层由代理层在返回的 HTML 文档里注入（工作台 UI 来自官方 `@deepseek-ai/dsh` npm 包，
+> 不改上游源码）：仅对 `GET` + `200` + `text/html` 的响应生效，插入位置在 `</body>` 之前，
+> 因此不会打断宿主 SPA 的 `__DSH_BOOT__` 引导；长度为变后重算 `content-length`。
+> 配套地，**`Accept` 含 `text/html` 的请求会剥掉 `accept-encoding`**（强制 identity），
+> 否则拿到的是压缩字节、无法改写；ESM 断言等资源请求（`Accept: */*`）压缩照旧。
 
 ### 换肤（不需要重建镜像）
 
@@ -606,5 +651,6 @@ run 记录：`{id(网关任务id), at, status(done/failed/timeout/running), erro
 | gateway/1.6 | 1.6.0 | 镜像 `0.6.16`：内核升级 `@deepseek-ai/dsh 0.1.5-rc.1 → 0.1.5-rc.2`（合并上游 `0.1.5-rc.2` 到 `eftik-cloud`，冲突仅 `.gitignore`，gateway 定制 3493 行完整保留；rc.2 的 `text-chunks`/`reasoning-chunks` 结构与 rc.1 一致，gateway/1.5 的事件适配直接适用）。**修复对话记录恒为空 / 每次进入都是新会话**：原 `POST /chat` 仅在 `body.sessionId` 非空时才落会话记录，未给出时 `sessionStore = null` → `GET /sessions` 永远返回空数组；且同一路径下内核 sessionId 退化为 `task-<id>`，多轮对话实际断链。现改为：未带 sessionId 且是对话请求（有 `message`、非一次性 `task`）时，网关自己生成一个会话 id，正常走记账 + 传给内核 + 随响应回传 `session_id`。配套中台侧 `DshWorkspaceService` 改用 `chatRaw()` 认下回传的 `session_id` 并补写首轮 user 消息归属（原 `chat()` 只取 `task_id` 把 session_id 丢弃）。一次性任务与已有 sessionId 的调用方行为完全不变 |
 | gateway/1.7 | 1.7.2 | 镜像 `0.6.21`：**工作台登录页改版 —— 用自研品牌登录页替换浏览器原生 Basic Auth 弹框**。背景：原先 `WWW-Authenticate: Basic` 会弹一个无法自定义样式的浏览器原生对话框，与「狐分身」品牌完全不搭。**改造内容**：① 新增 `web-auth.js`（零依赖），实现基于 **HMAC-SHA256 签名 Cookie** 的浏览器会话：cookie 名 `eftik-session`（与上游 dsh 自己的 `dsh-auth-*` 严格区分），值为 `base64url("exp=<毫秒>").<hex签名>`，`HttpOnly + SameSite=Lax`；**签名密钥派生自密码哈希**，因此改密码会自动失效所有旧会话（这是想要的行为）。② 新增 `login.html` 单文件登录页（内联 CSS/JS，**不引入 Vue 或任何 UI 组件库**，无构建链、不增加 npm 依赖）：浅色暖调卡片呼应品牌插画，含登录面板与「首次设置密码」面板，密码显隐切换、记住我（30 天 / 不勾 12 小时）、内联错误提示与抖动动画、移动端自适应。③ `web-ui.js` 新增 `/_eftik/{login,logout,session,setup}` 四个接口与 `GET /branding/*` 静态资源路由，并按调用方形态分流：**浏览器导航** 失败 → `302 /_eftik/login`（或直接返回登录页）；**API 调用** 失败 → 仍回 `401 + WWW-Authenticate`，**小程序 / 脚本 / curl 的 Basic Auth 通道完全不受影响**（三种调用方共存）。④ 登录失败限流：滑动窗口 5 分钟内最多 10 次。⑤ `POST /_eftik/setup` 仅在尚未配置密码时可用，避免已配置后被匿名重置。⑥ 登录页背景图从 PVC 的 `/home/node/.dsh/branding/bg.*` 读取（镜像内置出厂默认，`entrypoint.sh` 只在 PVC 无同名文件时才拷贝，便于运维直接丢图换肤而无需重建镜像）。⑦ 登录页「已登录却回退到登录页」时 `302 /` 直接送进工作台。**注意**：镜像 tag 从 0.6.20 → 0.6.21，但网关协议版本保持 `gateway/1.7`（`/web-access` 等既有接口签名未变）。 |
 | gateway/1.8 | 1.8.0 | 镜像 `0.6.22`：**新增稳定错误码 `error_code`，修复「小程序 ↔ WebUI 交叉使用必炸」的用户体验**。背景：gateway/1.7（resume 插件）修好了「第二句必炸」，但引入新问题 —— 在浏览器里打开过某会话后，回小程序对**同一会话**发消息会报 `session "s-xxx" is already owned by an active write handle`（内核跨进程排他写锁 `session.lock` 被 `dsh web` 常驻进程持有）。**本版本改动**：① `/task`、`/task/{id}`、`/task/{id}/stream` 的终态新增 `error_code` 字段（无特殊分类为 `""`），识别到 `already owned by an active write handle` 时置为 `SESSION_LOCKED`；② 覆盖两处错误路径（JSON-RPC error 响应 + `turn/end` 的 `reason.error`），`job` 对象新增 `errorCode` 字段并在三处上报点透出。**⚠️ 关键实测结论（决定了提示语怎么写）**：关闭浏览器标签页**不会**释放该锁（锁跟 `dsh web` 进程走，内核无空闲过期）；唯一释放路径是该进程退出/容器重启。所以**唯一有效出路是新建会话**，提示语绝不能引导用户去关标签页。配套：中台 `DshWorkspaceService` 透传 `errorCode`（`dsh_chat_task` 新增 `error_code` 列，V68 迁移），小程序 `dsh-chat` 捕获后弹出「会话正在浏览器中打开」引导面板（「新建会话继续」/「我知道了」），选前者会自动换新会话并重发刚才那条消息 |
+| gateway/1.8 | 1.8.1 | 镜像 `0.6.23`：**新增「退出登录 / 清除登录缓存」**。背景：用户在同浏览器打开过同品牌其它子域的工作台后，本工作台会打不开（脏 cookie 残留），只能开无痕；而原先的 `POST /_eftik/logout` 只清了 `eftik-session` 一条 cookie，`dsh-auth-*` 与平台 cookie 都留着。**改动**：① `web-auth.js` 新增 `clearedCookieHeaders()` —— 把请求里**实际出现的每个 cookie 名**逐个置空（`Max-Age=0`），每个名字下发 host-only 与 `<当前 host>` 两个 Domain 变体；`clearCookie()` 已被其取代。② `/_eftik/logout` 支持 `GET`（地址栏直达，未登录也可用）+ `POST`；`?deep=1` 顺带重启上游 `dsh web`（换 launchToken 与内核侧 WebUI 会话），`?wide=1` 连**父域**同名 cookie 一起清（会波及其它同父域应用，故仅在「重置工作台」时启用）。③ 浏览器请求 `302 /_eftik/login?cleared=1|reset` 并整页跳转；脚本/小程序保持 `200` JSON 契约（新增 `deep`/`wide`/`cleared` 字段）。④ **工作台内浮动按钮**：代理层在返回的 HTML 文档 `</body>` 前注入自包含浮层（`退出登录` / `重置工作台`，纯 `<a href>` + 服务端 302）；配套**对 `Accept: text/html` 的请求剥掉 `accept-encoding`** 以拿到明文（资源请求压缩照旧），注入后重算 `content-length`。⑤ 登录页底部新增「清除本机登录缓存」入口，并在 `?cleared=` 时显示提示条。**网关协议版本保持 `gateway/1.8`**（`/web-access` 等既有接口签名未变）。专项测试 `.test-logout.cjs` 40 条断言；`web-ui.js` 新增本地测试接缝 `GW_WEB_LAUNCH_TOKEN`（本机无 dsh 二进制时给 launchToken 跳过 spawn，生产不设） |
 
 > ⚠️ **排查备忘（本次定位手段，可复用）**：验证「关标签页是否释放锁」**不需要真实浏览器** —— `session/follow` 就是「打开会话」的 RPC（触发 `promote` → `agents.resume` → 拿写锁），用 Node 24 内置 `WebSocket` 连 `/api/remote.mux` 直接调即可。三处帧格式易错：① `endpoint` 是 `namespace/method`（如 `session/follow`），**不是** descriptor id `@包名#方法`；② `payload` 必须包一层 `{args:{...}}`；③ 参数名严格按 descriptor（`follow` 的参数名是 `request`）。锁状态判据用 `flock -n <session.lock>` **试锁**（文件存在 ≠ 被持有，该文件永不删除）；fd 级证据看 `cat /proc/locks`（形如 `FLOCK ADVISORY WRITE <pid>`）与 `ls -l /proc/<web-pid>/fd | grep session.lock`。实测：客户端断开后 `flock` 仍 BLOCKED 且 web 进程仍持 1 个 fd，唯 `kill -9` web 进程后转 FREE。 |

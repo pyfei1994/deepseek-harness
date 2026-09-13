@@ -23,6 +23,7 @@ const crypto = require("crypto");
 
 const COOKIE_NAME = "eftik-session";
 const DEFAULT_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
+const MAX_CLEAR_COOKIES = 40;                    // 清 cookie 时最多处理多少个名字，防 Set-Cookie 头爆炸
 
 /* ---------- 小工具 ---------- */
 
@@ -54,10 +55,59 @@ function serializeCookie(name, value, opts) {
   const o = opts || {};
   let out = `${name}=${value}`;
   out += `; Path=${o.path || "/"}`;
+  if (o.domain) out += `; Domain=${o.domain}`;
   if (o.maxAge !== undefined) out += `; Max-Age=${Math.floor(o.maxAge)}`;
   if (o.httpOnly !== false) out += "; HttpOnly";
   if (o.secure) out += "; Secure";
   out += `; SameSite=${o.sameSite || "Lax"}`;
+  return out;
+}
+
+/** 收集请求里实际出现的 cookie 名（外加固定要清的 eftik-session） */
+function listCookieNames(req, extraNames) {
+  const names = new Set(extraNames || []);
+  names.add(COOKIE_NAME);
+  const raw = String((req.headers && req.headers.cookie) || "");
+  for (const part of raw.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx <= 0) continue;
+    const name = part.slice(0, idx).trim();
+    // 只认规整的 cookie 名并限长，避免被畸形/超长头放大成大量 Set-Cookie
+    if (!name || name.length > 128 || !/^[\w.\-]+$/.test(name)) continue;
+    names.add(name);
+  }
+  return Array.from(names).slice(0, MAX_CLEAR_COOKIES);
+}
+
+/**
+ * 生成「清空本域名 cookie」的一组 Set-Cookie 头。
+ *
+ * 为什么按「请求里实际出现的名字」清：Set-Cookie 的 Domain/Path 必须能对上浏览器
+ * 里那条 cookie 才会生效，而我们看不到对方的 Domain 属性，只能把浏览器真的发过来
+ * 的名字逐个置空。每个名字下发两条：
+ *   1) 不带 Domain      → 命中 host-only cookie（我们自己下发的都属于这种）
+ *   2) 带 Domain=<host> → 命中显式写了域名的 cookie
+ * 第 2 条的域名必然与当前 host domain-match，浏览器不会拒收；若该 cookie 不存在则无事发生。
+ *
+ * opts.wideDomain 额外清「父域」（a.sealosbja.site → sealosbja.site）：用于「打开过
+ * 同品牌其它子域后被脏 cookie 挡住」的场景。副作用是会一并清掉该父域上**同名** cookie
+ *（可能影响同父域其它应用），因此只在用户显式选择「重置工作台」时才开。
+ */
+function clearedCookieHeaders(req, opts) {
+  const o = opts || {};
+  const host = String(o.host || "").trim().toLowerCase().replace(/:\d+$/, "");
+  const domains = [];
+  if (host) domains.push(host);
+  if (o.wideDomain && host && !/^\d+(\.\d+){3}$/.test(host)) {
+    const parent = host.split(".").slice(1).join(".");
+    if (parent.includes(".")) domains.push(parent);
+  }
+  const out = [];
+  for (const name of listCookieNames(req, o.extraNames)) {
+    for (const domain of [""].concat(domains)) {
+      out.push(serializeCookie(name, "", { maxAge: 0, httpOnly: false, sameSite: "Lax", domain }));
+    }
+  }
   return out;
 }
 
@@ -68,7 +118,7 @@ function serializeCookie(name, value, opts) {
  * @param {string} cfg.passwordPath   sha256(密码) 的 hex 落盘路径
  * @param {number} [cfg.ttlMs]        Cookie 有效期，默认 30 天
  * @param {string[]} [cfg.browserHints] 判定「这是浏览器」的 Accept 特征
- * @returns {{ verifyBrowser, verifyBasic, login, logout, issueCookie, clearCookie, isConfigured, isBrowserRequest, passwordMatches }}
+ * @returns {{ verifyBrowser, verifyBasic, verifyAny, isBrowserRequest, isConfigured, passwordMatches, issueCookie, clearCookies }}
  */
 function createWebAuth(cfg) {
   const fs = cfg.fs || require("fs");
@@ -185,9 +235,9 @@ function createWebAuth(cfg) {
     });
   }
 
-  /** 登出：让浏览器立刻丢弃 cookie */
-  function clearCookie() {
-    return serializeCookie(COOKIE_NAME, "", { maxAge: 0, httpOnly: true, sameSite: "Lax" });
+  /** 登出：生成「把本域名下 cookie 全部作废」的 Set-Cookie 列表（见 clearedCookieHeaders） */
+  function clearCookies(req, opts) {
+    return clearedCookieHeaders(req, opts);
   }
 
   return {
@@ -199,8 +249,8 @@ function createWebAuth(cfg) {
     verifyAny,
     isBrowserRequest,
     issueCookie,
-    clearCookie,
+    clearCookies,
   };
 }
 
-module.exports = { createWebAuth, COOKIE_NAME, sha256Hex, readCookie, safeEqual };
+module.exports = { createWebAuth, clearedCookieHeaders, listCookieNames, COOKIE_NAME, sha256Hex, readCookie, safeEqual };

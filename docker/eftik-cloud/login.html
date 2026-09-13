@@ -198,6 +198,22 @@
   }
 
   .foot { margin-top: 22px; text-align: center; font-size: 11.5px; color: var(--text-faint); line-height: 1.7; }
+  .foot a { color: var(--text-dim); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+  .foot a:hover { color: var(--accent); }
+
+  /* 退出/重置后的提示条（?cleared=1 时由脚本显示） */
+  .notice {
+    display: none;
+    margin: 0 0 16px;
+    padding: 9px 12px;
+    border-radius: 10px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    background: var(--accent-soft);
+    border: 1px solid rgba(240, 138, 60, 0.28);
+    color: var(--text-dim);
+  }
+  .notice.show { display: block; }
 
   /* 首次设置密码时的额外面板 */
   .setup { display: none; }
@@ -237,6 +253,7 @@
       <h1>欢迎回来</h1>
       <p class="hint">请输入工作台访问密码以继续</p>
 
+      <div class="notice" id="notice" role="status"></div>
       <div class="error" id="err" role="alert"></div>
 
       <form id="form" autocomplete="on" novalidate>
@@ -264,7 +281,10 @@
         </button>
       </form>
 
-      <p class="foot">在「狐分身」小程序 → 工具 → ⚙️ →「WebUI 公网访问」中设置或修改密码</p>
+      <p class="foot">
+        在「狐分身」小程序 → 工具 → ⚙️ →「WebUI 公网访问」中设置或修改密码<br>
+        打不开或反复跳回登录页？<a href="/_eftik/logout">清除本机登录缓存</a>
+      </p>
     </div>
 
     <!-- 首次设置密码（未配置密码时展示） -->
@@ -309,6 +329,19 @@
   var submit = document.getElementById('submit');
   var submitText = document.getElementById('submit-text');
   var submit2 = document.getElementById('submit2');
+
+  /* ---- 退出/重置后的提示：读 ?cleared=1|reset，读完即从地址栏抹掉 ---- */
+  (function () {
+    var notice = document.getElementById('notice');
+    var cleared = new URLSearchParams(location.search).get('cleared');
+    if (!cleared || !notice) return;
+    notice.textContent = cleared === 'reset'
+      ? '重置完成：本机登录缓存已清空，工作台会话已重启。请重新输入密码进入。'
+      : '已清除本机登录缓存，请重新输入密码。';
+    notice.classList.add('show');
+    // 抹掉查询串，避免刷新时重复提示
+    try { history.replaceState(null, '', location.pathname); } catch (e) {}
+  })();
 
   /* ---- 显示/隐藏密码 ---- */
   document.getElementById('toggle').addEventListener('click', function () {

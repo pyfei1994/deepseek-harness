@@ -34,6 +34,79 @@ function hasDshCookie(req) {
   return raw ? DSH_COOKIE_RE.test(raw) : false;
 }
 
+/* ---------- 浮动「退出登录 / 重置工作台」 ---------- */
+
+// 工作台页面来自官方 @deepseek-ai/dsh npm 包，我们不改上游源码；而「退出」入口
+// 必须在「已经进了工作台」时也能点到，所以只能在代理层往返回的 HTML 文档末尾
+// 追加一段自包含的浮层。用纯 <a href> + 服务端 302，不依赖页面里的任何 JS 环境。
+const LOGOUT_MARK = 'data-eftik-logout';
+const LOGOUT_WIDGET = `
+<div ${LOGOUT_MARK}>
+  <style>
+    [${LOGOUT_MARK}]{position:fixed;right:16px;bottom:16px;z-index:2147483000;display:flex;gap:8px;align-items:center;
+      font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+    [${LOGOUT_MARK}] a{display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:17px;
+      font-size:13px;line-height:1;text-decoration:none;border:1px solid rgba(0,0,0,.10);
+      background:rgba(255,255,255,.92);color:#3c3c43;box-shadow:0 2px 10px rgba(0,0,0,.12);
+      -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);opacity:.6;
+      transition:opacity .15s ease,transform .15s ease}
+    [${LOGOUT_MARK}] a:hover{opacity:1;transform:translateY(-1px)}
+    [${LOGOUT_MARK}] a.eftik-lo-primary{border-color:transparent;background:#f0763a;color:#fff}
+    [${LOGOUT_MARK}] a.eftik-lo-deep{color:#8a8a8e}
+    body[data-ds-dark-theme] [${LOGOUT_MARK}] a{background:rgba(48,48,52,.92);color:#e8e8ea;border-color:rgba(255,255,255,.14)}
+    body[data-ds-dark-theme] [${LOGOUT_MARK}] a.eftik-lo-deep{color:#9a9aa0}
+    @media (prefers-color-scheme:dark){
+      [${LOGOUT_MARK}] a{background:rgba(48,48,52,.92);color:#e8e8ea;border-color:rgba(255,255,255,.14)}
+      [${LOGOUT_MARK}] a.eftik-lo-deep{color:#9a9aa0}
+    }
+    @media (max-width:520px){[${LOGOUT_MARK}]{right:10px;bottom:10px}}
+  </style>
+  <a class="eftik-lo-deep" href="/_eftik/logout?deep=1&amp;wide=1"
+     onclick="return confirm('重置工作台会重启 WebUI 会话，当前页面上正在跑的任务会中断。确定继续？')">重置工作台</a>
+  <a class="eftik-lo-primary" href="/_eftik/logout">退出登录</a>
+</div>
+`;
+
+/** 只有「浏览器导航拿到的 HTML 文档」才注入：GET + 200 + text/html 且未压缩 */
+function isHtmlDocumentResponse(req, status, headers) {
+  if (status !== 200 || req.method !== 'GET') return false;
+  if (!/text\/html/i.test(String(headers['content-type'] || ''))) return false;
+  // 请求侧已强制 identity 编码；万一上游仍压缩返回，宁可不注入也不能吐坏字节
+  return !headers['content-encoding'];
+}
+
+/** 缓冲 HTML → 插入浮层 → 重算长度返回（长度变了，分块/压缩相关头必须清掉） */
+function injectLogoutWidget(status, headers, upstream, res) {
+  const chunks = [];
+  upstream.on('data', (chunk) => chunks.push(chunk));
+  upstream.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end('DSH WebUI 暂不可用'); });
+  upstream.on('end', () => {
+    let html = Buffer.concat(chunks).toString('utf8');
+    if (!html.includes(LOGOUT_MARK)) {
+      // 宿主 SPA 的引导脚本都在 <body> 内，追加在 </body> 之前不会打断 __DSH_BOOT__
+      html = html.includes('</body>')
+        ? html.replace('</body>', `${LOGOUT_WIDGET}</body>`)
+        : html + LOGOUT_WIDGET;
+    }
+    const buf = Buffer.from(html, 'utf8');
+    const out = { ...headers };
+    delete out['content-encoding'];
+    delete out['transfer-encoding'];
+    out['content-length'] = String(buf.length);
+    res.writeHead(status, out);
+    res.end(buf);
+  });
+}
+
+/** 重启上游 dsh web：换掉 launchToken 与内核侧的 WebUI 会话（「重置工作台」用） */
+function restartWeb(reason) {
+  launchToken = '';
+  if (!web) return false;
+  process.stderr.write(`[web-proxy] 重启 dsh web（${reason}）\n`);
+  try { web.kill('SIGTERM'); } catch {}
+  return true;
+}
+
 function authorized(req) {
   return auth.verifyAny(req);
 }
@@ -134,8 +207,31 @@ async function handleAuthRoutes(req, res, url) {
     return sendJson(res, 200, { ok: true }, cookie ? { 'Set-Cookie': cookie } : undefined), true;
   }
 
-  if (p === '/_eftik/logout') {
-    return sendJson(res, 200, { ok: true }, { 'Set-Cookie': auth.clearCookie() }), true;
+  // 退出登录 / 清除登录缓存。GET 可直接在地址栏敲（进不去工作台时的兜底），
+  // POST 供脚本与小程序调用（返回 JSON + 同样的 Set-Cookie）。
+  //   ?deep=1  顺带重启上游 dsh web：换掉 launchToken 与内核侧 WebUI 会话
+  //   ?wide=1  连父域（如 .sealosbja.site）上的同名 cookie 一起清
+  //            —— 用于「打开过同品牌其它子域后被脏 cookie 挡住」的场景
+  if (p === '/_eftik/logout' && (req.method === 'GET' || req.method === 'POST')) {
+    let deep = url.searchParams.get('deep') === '1';
+    let wide = url.searchParams.get('wide') === '1';
+    if (req.method === 'POST') {
+      const body = await readJsonBody(req);
+      if (body && body.deep === true) deep = true;
+      if (body && body.wide === true) wide = true;
+    }
+    const cleared = auth.clearCookies(req, {
+      host: String(req.headers.host || '').split(':')[0],
+      wideDomain: wide,
+    });
+    if (deep) restartWeb('logout deep=1');
+    const headers = { 'Set-Cookie': cleared };
+    if (auth.isBrowserRequest(req)) {
+      // 浏览器走整页跳转，看完登录页的提示文案再重登
+      res.writeHead(302, { ...headers, Location: `/_eftik/login?cleared=${wide ? 'reset' : '1'}`, 'Cache-Control': 'no-store' });
+      return res.end(), true;
+    }
+    return sendJson(res, 200, { ok: true, deep, wide, cleared: cleared.length }, headers), true;
   }
 
   // 前端启动时问一次：是否已配置密码（决定显示登录还是设置密码）
@@ -180,6 +276,10 @@ async function handleAuthRoutes(req, res, url) {
 function upstreamHeaders(req) {
   const headers = { ...req.headers, host: `127.0.0.1:${UPSTREAM_PORT}` };
   delete headers.authorization;
+  // 浏览器导航要的是 gzip/br，但我们要往 HTML 里注入浮动按钮，必须拿到明文再改。
+  // 只对「Accept 含 text/html」的文档请求强制 identity；ESM 断言等资源请求
+  //（Accept: */*）不受影响，压缩照旧。
+  if (/text\/html/i.test(String(headers.accept || ''))) delete headers['accept-encoding'];
   if (headers.origin) headers.origin = `http://127.0.0.1:${UPSTREAM_PORT}`;
   headers['x-forwarded-proto'] = 'https';
   return headers;
@@ -204,6 +304,11 @@ function startWeb() {
   });
 }
 startWeb();
+// 本地测试接缝：容器里 launchToken 由上面从 dsh stdout 解析；本机没有 dsh 二进制时
+// 打不通「已鉴权 → 放行到上游」这条链路（会停在 503「正在启动」），注入逻辑就没法测。
+// 设 GW_WEB_LAUNCH_TOKEN 可直接给定 token 跳过 spawn。必须放在 startWeb() 之后
+//（startWeb 会清空它）。生产不设此变量，行为无变化。
+if (process.env.GW_WEB_LAUNCH_TOKEN) launchToken = process.env.GW_WEB_LAUNCH_TOKEN;
 fs.watchFile(PLUGIN_RELOAD_PATH, { interval: 1000 }, (current, previous) => {
   if (!stopping && current.mtimeMs !== previous.mtimeMs && web) {
     process.stderr.write('[dsh-web] plugin profile changed, reloading\n');
@@ -337,6 +442,9 @@ const server = http.createServer(async (req, res) => {
       retry.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end('DSH WebUI 暂不可用'); });
       retry.end();
       return;
+    }
+    if (isHtmlDocumentResponse(req, status, headers)) {
+      return injectLogoutWidget(status, headers, upstream, res);
     }
     res.writeHead(status, headers);
     upstream.pipe(res);
