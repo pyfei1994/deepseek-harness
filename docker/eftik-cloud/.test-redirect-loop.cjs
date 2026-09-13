@@ -30,24 +30,11 @@ function check(name, cond, extra) {
 
 /* ---- 假 dsh：打印含 ?token= 的启动日志后常驻 ----
    web-ui.js 里 spawn('dsh', ['web', ...]) 是硬编码无扩展名命令。Windows 上必须
-   shell:true + .cmd 才能命中，因此这里用 NODE_OPTIONS=--require 注入一个垫片，
-   把 child_process.spawn 包一层（仅在本次测试进程内生效，不动生产代码）。 */
-const fakeDshJs = path.join(TMP, "fake-dsh.js");
-fs.writeFileSync(fakeDshJs, `process.stderr.write("dsh web listening on http://127.0.0.1:${UPSTREAM_PORT}/?token=${TOKEN}\\n");
-setInterval(() => {}, 1 << 30);
-`);
-const shimPath = path.join(TMP, "spawn-shim.cjs");
-fs.writeFileSync(shimPath, `
-const cp = require("child_process");
-const orig = cp.spawn;
-const NODE_BIN = ${JSON.stringify(process.execPath)};
-cp.spawn = function (cmd, args, opts) {
-  if (cmd === "dsh") {
-    return orig(NODE_BIN, [${JSON.stringify(fakeDshJs)}].concat(args || []), opts);
-  }
-  return orig.apply(this, arguments);
-};
-`);
+   ⚠️ 2026-09-13 起 web-ui.js **不再自己 spawn dsh web**（进程归网关的平面 B 引擎独占，
+   两个进程共用 DSH_HOME 会争 session.lock）。所以这里不再需要「假 dsh + spawn 垫片」，
+   改成直接按新契约往 token 文件写一个 token。 */
+const TOKEN_PATH = path.join(TMP, "eftik-web-token");
+fs.writeFileSync(TOKEN_PATH, TOKEN);
 
 /* ---- 假 upstream：复刻 dsh web 的鉴权行为 ---- */
 let upstreamHits = [];
@@ -115,14 +102,12 @@ async function browse(port, startPath, headers, initialCookie) {
 (async () => {
   await new Promise((r) => upstream.listen(UPSTREAM_PORT, "127.0.0.1", r));
 
-  // 把假 dsh 放到 PATH 最前，并通过 NODE_OPTIONS 注入 spawn 垫片
+  // web-ui.js 现在只从 token 文件读 launch token（进程归网关的平面 B 引擎）
   const env = { ...process.env };
-  env.PATH = TMP + path.delimiter + (env.PATH || "");
-  // 用 NODE_OPTIONS 同时预加载：CJS 垫片（让 web-ui.js 在 type:module 仓库根下可跑）
-  // + spawn 垫片（把 spawn('dsh') 换成假 dsh）。两者互不干扰。
-  env.NODE_OPTIONS = `--require ${shimPath} --require ${path.join(__dirname, ".cjs-preload.cjs")}`;
+  env.NODE_OPTIONS = `--require ${path.join(__dirname, ".cjs-preload.cjs")}`;
   env.GW_WEB_PORT = String(PROXY_PORT);
   env.GW_WEB_UPSTREAM_PORT = String(UPSTREAM_PORT);
+  env.GW_WEB_TOKEN_PATH = TOKEN_PATH;
   env.GW_WEB_PASSWORD_PATH = path.join(TMP, "pw.sha256");
   env.GW_LOGIN_HTML = path.join(__dirname, "login.html");
   env.GW_BRANDING_DIR = path.join(__dirname, "branding");

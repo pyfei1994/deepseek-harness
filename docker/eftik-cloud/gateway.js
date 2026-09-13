@@ -86,7 +86,14 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/1.8";
+const { createWebEngine } = require("./web-engine");
+
+const GATEWAY_VERSION = "gateway/1.9";
+// 执行引擎：web = 平面 B（Typert Remote，能力全，默认）｜ sdk = 平面 A（stdio，回退用）
+// ⚠️ 两者绝不能混用同一会话（会争 session.lock，即历史上 already exists / already owned 的根因）
+const ENGINE = process.env.GW_ENGINE === "sdk" ? "sdk" : "web";
+const WEB_ENGINE_PORT = Number(process.env.GW_WEB_ENGINE_PORT || 3080);
+const WEB_TOKEN_PATH = process.env.GW_WEB_TOKEN_PATH || "/home/node/.dsh/eftik-web-token";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -725,6 +732,12 @@ function newJob(id, task, settings, source, sessionId) {
     status: "queued", reply: "", error: "", events: [], createdAt: Date.now(),
     // 稳定错误码（如 SESSION_LOCKED），供中台/小程序分流；空串=无特殊分类。
     errorCode: "",
+    // 面向用户的失败文案对应的英文原文（排障用，前端不展示）
+    errorDetail: "",
+    // 交互（AI 提问 / 工具审批）：interactions 给订阅方的事件队列，
+    // pendingInteractions 是等待客户端回答案的活条目（eventId → interaction）
+    interactions: [],
+    pendingInteractions: new Map(),
     stream: [],    // [{seq,kind:'answer'|'thinking',text,t}] 增量事件（正文/思考）
     seq: 0,        // 增量事件序号游标
     waiters: [],   // 等待新增量的订阅回调（streamTask 用）
@@ -762,6 +775,20 @@ function pushThinking(job, text) {
   flushStream(job);
 }
 
+/** 推送一次交互（AI 提问 / 工具审批），订阅方渲染成卡片等用户选择 */
+function pushInteraction(job, interaction) {
+  job.seq = (job.seq || 0) + 1;
+  job.interactions.push({ seq: job.seq, ...interaction });
+  flushStream(job);
+}
+
+/** 交互被回答：让订阅方把卡片置为已选 */
+function resolveInteraction(job, id, outcome) {
+  job.seq = (job.seq || 0) + 1;
+  job.interactions.push({ seq: job.seq, id, kind: "resolved", outcome, t: Date.now() });
+  flushStream(job);
+}
+
 /** 唤醒正在消费该 job 增量流的订阅方 */
 function flushStream(job) {
   const waiters = job.waiters;
@@ -772,6 +799,12 @@ function flushStream(job) {
   }
 }
 
+/** 任务终态集合。⚠️ 新增终态（如 cancelled）必须同时改这里，否则 SSE 不发 done、订阅方会忙轮询 */
+const TERMINAL_STATUSES = ["done", "failed", "timeout", "cancelled"];
+function isTerminal(status) {
+  return TERMINAL_STATUSES.includes(status);
+}
+
 /** 等待新增量或任务进入终态；timeoutMs 到点也返回，便于订阅方做心跳。
  *
  *  ⚠️ 注意：终态（done/failed/timeout）在回放队列走完之前不解除阻塞。
@@ -779,7 +812,7 @@ function flushStream(job) {
  *  否则 waitStream 会立刻 resolve → streamTask 忙轮询 → CPU 打满。
  */
 function waitStream(job, timeoutMs) {
-  const settled = ["done", "failed", "timeout"].includes(job.status);
+  const settled = isTerminal(job.status);
   const settleAt = job.settledAt || job.finishedAt || 0;
   if (settled && Date.now() >= settleAt) return Promise.resolve();
   return new Promise((resolve) => {
@@ -870,6 +903,65 @@ function isSessionLockedError(message) {
 /** 给 job 打上稳定错误码（供 /task、/task/:id 与流式终态透出）。 */
 function tagJobErrorCode(job, errorCode) {
   job.errorCode = errorCode || "";
+}
+
+/* ---------- 面向用户的错误归一（不要再把内核英文原文抛到界面上） ----------
+
+   背景：内核 sdk 传输层把一切失败压成 -32603 + message，平面 B 也常抛英文原句。
+   前端拿到的应该是**中文可读文案 + 稳定错误码**，英文原文放 error_detail 供排障。
+   ⚠️ 前端只许按 error_code 分流，绝不能去匹配文案（文案会随上游变）。
+*/
+
+const ERROR_CODE_CANCELLED = "CANCELLED";
+const ERROR_CODE_NO_APPROVAL_CHANNEL = "NO_APPROVAL_CHANNEL";
+const ERROR_CODE_MODEL_AUTH = "MODEL_AUTH";
+const ERROR_CODE_MODEL_RATE_LIMIT = "MODEL_RATE_LIMIT";
+const ERROR_CODE_MODEL_ERROR = "MODEL_ERROR";
+const ERROR_CODE_SESSION_LOST = "SESSION_LOST";
+const ERROR_CODE_TIMEOUT = "TIMEOUT";
+const ERROR_CODE_WORKSPACE_FULL = "WORKSPACE_FULL";
+const ERROR_CODE_KERNEL_NOT_READY = "KERNEL_NOT_READY";
+
+/** 一条原始错误 → { code, message(中文) }；未命中则给通用兜底文案。 */
+function classifyUserError(raw) {
+  const s = String(raw || "");
+  if (isSessionLockedError(s)) {
+    return { code: ERROR_CODE_SESSION_LOCKED, message: "该会话正在浏览器里的工作台打开，请新建会话继续派活" };
+  }
+  if (/no approval channel is available|requires approval/i.test(s)) {
+    return { code: ERROR_CODE_NO_APPROVAL_CHANNEL, message: "这项操作需要授权，但当前没有可用的授权通道，已被安全策略拒绝" };
+  }
+  if (/\b(AUTH|401|403)\b/.test(s) || /api[\s_-]?key|credential|unauthor|invalid token/i.test(s)) {
+    return { code: ERROR_CODE_MODEL_AUTH, message: "模型凭证无效或已过期，请在「工作台设置」里更新 DeepSeek API Key" };
+  }
+  if (/rate ?limit|429|too many requests|quota exceeded/i.test(s)) {
+    return { code: ERROR_CODE_MODEL_RATE_LIMIT, message: "模型请求过于频繁或额度不足，请稍后再试" };
+  }
+  if (/ENOSPC|no space left/i.test(s)) {
+    return { code: ERROR_CODE_WORKSPACE_FULL, message: "工作区空间不足，请先清理文件再试" };
+  }
+  if (/spawn dsh ENOENT|kernel not ready|正在启动/i.test(s)) {
+    return { code: ERROR_CODE_KERNEL_NOT_READY, message: "工作台内核尚未就绪，请稍后重试" };
+  }
+  if (/session ".*" not found|session\/not-found/i.test(s)) {
+    return { code: ERROR_CODE_SESSION_LOST, message: "会话已失效，请新建会话继续" };
+  }
+  if (/timeout|timed out|超时/i.test(s)) {
+    return { code: ERROR_CODE_TIMEOUT, message: "执行超时，请重试或简化任务" };
+  }
+  return { code: ERROR_CODE_MODEL_ERROR, message: "执行失败，请重试；若持续失败请检查模型配置" };
+}
+
+/** 统一收敛 job 的失败态：中文 message 给界面，英文原文进 error_detail。 */
+function failJob(job, status, raw) {
+  const rawText = String((raw && raw.message) || raw || "未知错误");
+  const { code, message } = classifyUserError(rawText);
+  job.error = message;
+  job.errorDetail = rawText.slice(0, 1000);
+  tagJobErrorCode(job, code);
+  markJobFinished(job, status || "failed", Date.now());
+  job.events.push({ t: Date.now(), text: `[error] ${code}: ${rawText.slice(0, 300)}` });
+  return job;
 }
 
 /**
@@ -1221,6 +1313,28 @@ function startSdkPrompt(job) {
   });
 }
 
+/**
+ * 一回合的统一入口：按引擎分发。
+ * web 引擎自己负责收尾（成功/失败/取消都会落到 job 上），这里只兜住装配阶段的异常，
+ * 并防止「引擎已经收尾了又收一次」。
+ */
+async function runTurn(job) {
+  if (!webEngine) return runDsh(job);
+  try {
+    job.kernelId = await webEngine.ensureKernelSession(job.sessionId, {});
+    await webEngine.applySettings(job.kernelId, job.settings, job);
+  } catch (e) {
+    failJob(job, "failed", e);
+    return null;
+  }
+  try {
+    return await webEngine.runTurn(job);
+  } catch (e) {
+    if (!["done", "failed", "timeout", "cancelled"].includes(job.status)) failJob(job, "failed", e);
+    return null;
+  }
+}
+
 function runDsh(job) {
   return new Promise((resolve) => {
     // 默认 headless（一次任务、写完即退）；SDK profile 支持逐字流式，
@@ -1443,6 +1557,7 @@ async function streamTask(req, res, job) {
   };
   let cursor = 0;   // stream 游标
   let sent = 0;     // events（日志）游标
+  let ixSent = 0;   // interactions（提问/审批）游标
   let closed = false;
   req.on("close", () => { closed = true; });
 
@@ -1454,10 +1569,14 @@ async function streamTask(req, res, job) {
     for (; sent < job.events.length; sent++) {
       write("log", job.events[sent]);
     }
+    // AI 提问 / 工具审批：下发卡片，等客户端 POST /task/{id}/interaction 回答案
+    for (; ixSent < (job.interactions || []).length; ixSent++) {
+      write("interaction", job.interactions[ixSent]);
+    }
     // 终态可见性由 settledAt 决定：新版回放（replayAssistantStream）把增量排在
     // 定时器里，而 turn/end 几乎同时到达并已置 status=done。这里必须等回放队列
     // 跑完再发 done，否则订阅方在第一个增量事件之前就 break，打字机效果全丢。
-    if (["done", "failed", "timeout"].includes(job.status)) {
+    if (isTerminal(job.status)) {
       const settleAt = job.settledAt || job.finishedAt || 0;
       if (Date.now() < settleAt) {
         await waitStream(job, Math.min(settleAt - Date.now(), 1000));
@@ -1466,6 +1585,7 @@ async function streamTask(req, res, job) {
       write("done", {
         status: job.status, reply: job.reply, error: job.error,
         error_code: job.errorCode || "",
+        error_detail: job.errorDetail || "",
         elapsed_ms: (job.finishedAt || Date.now()) - job.createdAt,
         usage: job.usage || null,
       });
@@ -1476,14 +1596,86 @@ async function streamTask(req, res, job) {
   try { res.end(); } catch {}
 }
 
+/* ---------- 执行引擎装配 ----------
+
+   web（平面 B，默认）：能力全 —— 取消、审批、提问、会话级模型、agent 预设、原生打字机。
+   sdk（平面 A，回退）：只有三个方法，取消靠杀进程、审批无通道，用作 GW_ENGINE=sdk 降级。
+   引擎只负责「把一回合跑完并驱动 job」，对外接口与 SSE 形态完全不变。
+*/
+const webEngine = ENGINE === "web" ? createWebEngine({
+  port: WEB_ENGINE_PORT,
+  workdir: WORKDIR,
+  tokenPath: WEB_TOKEN_PATH,
+  pluginReloadPath: PLUGIN_RELOAD_PATH,
+  log: (m) => process.stderr.write(m + "\n"),
+  hooks: {
+    pushAnswer: (job, text) => pushAnswer(job, text),
+    pushThinking: (job, text) => pushThinking(job, text),
+    setUsage: (job, u) => { job.usage = normalizeUsage(u); },
+    pushLog: (job, text) => { if (job.events.length < MAX_EVENTS) job.events.push({ t: Date.now(), text: String(text).slice(0, 300) }); },
+    pushInteraction: (job, it) => pushInteraction(job, it),
+    pushInteractionResolved: (job, id, outcome) => resolveInteraction(job, id, outcome),
+    classify: (raw) => classifyUserError(raw),
+    // 交互答案要挂到「正在跑这个内核会话」的任务上；agentId 就是内核 sessionId
+    findJobByKernelId: (kernelId) => {
+      for (const job of jobs.values()) {
+        if (job.kernelId && job.kernelId === kernelId && !["done", "failed", "timeout", "cancelled"].includes(job.status)) return job;
+      }
+      return null;
+    },
+    finish: (job, status, err, errorCode, errorDetail) => {
+      if (status === "done") {
+        recordSessionReply(job);
+        markJobFinished(job, "done", Date.now());
+        return;
+      }
+      if (status === "cancelled") {
+        // 用户主动停止：不是故障，不进 error（前端据 errorCode=CANCELLED 显示「已停止」）
+        job.error = "";
+        tagJobErrorCode(job, ERROR_CODE_CANCELLED);
+        job.events.push({ t: Date.now(), text: "用户已停止该任务" });
+        markJobFinished(job, "cancelled", Date.now());
+        return;
+      }
+      const raw = errorDetail || err || "未知错误";
+      failJob(job, status, raw);
+      if (errorCode && job.errorCode === ERROR_CODE_MODEL_ERROR) tagJobErrorCode(job, errorCode);
+    },
+  },
+}) : null;
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
+
+  // 容器内组件互调的内部入口：不要求 GW_TOKEN（调用方是 web-ui.js，拿不到业务令牌），
+  // 但必须带 X-GW-Admin。放在令牌校验之前，否则会被 401 挡掉。
+  // ⚠️ 外部经 /_eftik/api 前缀转发进来时**同样会命中这里**，所以这里只认 X-GW-Admin 这个
+  // 容器内才持有的令牌 —— 绝不能改成「只校验来源 IP」（转发后来源就是 127.0.0.1）。
+  if (url.pathname.startsWith("/internal/")) {
+    if (!isAdmin(req)) return send(res, 403, { error: "forbidden" });
+    if (req.method === "POST" && url.pathname === "/internal/engine/restart-web") {
+      if (!webEngine) return send(res, 400, { error: "当前引擎不支持（GW_ENGINE=sdk）" });
+      const body = await readBody(req, 32 * 1024).catch(() => ({}));
+      webEngine.restartWeb((body && body.reason) || "internal");
+      return send(res, 200, { ok: true, engine: ENGINE });
+    }
+    if (req.method === "GET" && url.pathname === "/internal/engine/status") {
+      return send(res, 200, { engine: ENGINE, web: webEngine ? webEngine.status() : null });
+    }
+    return send(res, 404, { error: "not found" });
+  }
+
   if (GW_TOKEN && req.headers["x-gw-token"] !== GW_TOKEN) {
     return send(res, 401, { error: "invalid gateway token" });
   }
   try {
     if (req.method === "GET" && url.pathname === "/health") {
-      return send(res, 200, { ok: true, dsh: dshVersion, version: GATEWAY_VERSION, jobs: jobs.size });
+      return send(res, 200, {
+        ok: true, dsh: dshVersion, version: GATEWAY_VERSION, jobs: jobs.size,
+        engine: ENGINE,
+        // 平面 B 引擎就绪状态：ready=false 时 /chat 会失败，便于快速判定「内核还没起来」
+        engine_ready: webEngine ? webEngine.ready() : true,
+      });
     }
 
     /* ---------- 工作区容量 ---------- */
@@ -1850,7 +2042,7 @@ const server = http.createServer(async (req, res) => {
       // 单用户容器内串行执行
       enqueue(() => {
         job.status = "running";
-        return runDsh(job);
+        return runTurn(job);
       });
       return send(res, 200, { task_id: id, session_id: sessionId });
     }
@@ -1862,9 +2054,43 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         status: job.status, reply: job.reply, error: job.error,
         error_code: job.errorCode || "",
+        // 英文原文（排障用，前端不展示）
+        error_detail: job.errorDetail || "",
+        // 尚未回答的交互，客户端刷新后据此恢复卡片
+        pending_interactions: Array.from((job.pendingInteractions || new Map()).values()),
         events: job.events, elapsed_ms: (job.finishedAt || Date.now()) - job.createdAt,
         usage: job.usage || null,
       });
+    }
+
+    // 回答案 AI 的提问 / 工具审批
+    // body: { id, outcome: {kind:'result', value}|{kind:'rejected',error}|{kind:'next'} }
+    // 或简化写法 { id, value: 'allowed-once' | 'rejected' | ... } / { id, selected: [...] }
+    const im = url.pathname.match(/^\/task\/([\w-]+)\/interaction$/);
+    if (req.method === "POST" && im) {
+      const job = jobs.get(im[1]);
+      if (!job) return send(res, 404, { error: "task not found" });
+      if (!webEngine) return send(res, 400, { error: "当前引擎不支持交互（GW_ENGINE=sdk）" });
+      const body = await readBody(req, 64 * 1024);
+      const id = body && body.id;
+      if (!id) return send(res, 400, { error: "id 必填" });
+      let outcome = body.outcome;
+      if (!outcome) {
+        if (typeof body.value === "string") {
+          outcome = { kind: "result", value: body.value };
+        } else if (Array.isArray(body.selected) || typeof body.custom === "string") {
+          // 提问的答案形态：内核要 { answers:[{id, selected[], custom?}] }
+          outcome = { kind: "result", value: { answers: [{ id, selected: body.selected || [], ...(body.custom ? { custom: body.custom } : {}) }] } };
+        } else {
+          return send(res, 400, { error: "outcome 或 value 必填" });
+        }
+      }
+      try {
+        const applied = await webEngine.respond(job, id, outcome);
+        return send(res, 200, { ok: true, outcome: applied });
+      } catch (e) {
+        return send(res, 400, { error: e.message });
+      }
     }
 
     const sm = url.pathname.match(/^\/task\/([\w-]+)\/stream$/);
@@ -1876,7 +2102,14 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "DELETE" && m) {
       const job = jobs.get(m[1]);
-      if (job && job.pid) { try { process.kill(job.pid, "SIGKILL"); } catch {} }
+      if (!job) return send(res, 404, { error: "task not found" });
+      if (isTerminal(job.status)) return send(res, 200, { ok: true, already: job.status });
+      if (webEngine) {
+        // 平面 B：内核原生中断（turn/end reason=aborted），比杀进程优雅得多
+        await webEngine.cancel(job);
+      } else if (job.pid) {
+        try { process.kill(job.pid, "SIGKILL"); } catch {}
+      }
       return send(res, 200, { ok: true });
     }
 
@@ -1887,6 +2120,26 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[dsh-gw ${GATEWAY_VERSION}] listening on 0.0.0.0:${PORT} (dsh ${dshVersion || "?"})`);
+  console.log(`[dsh-gw ${GATEWAY_VERSION}] listening on 0.0.0.0:${PORT} (dsh ${dshVersion || "?"}, engine=${ENGINE})`);
   startScheduler();
+  // 平面 B 引擎：自己拉起并独占 dsh web，web-ui.js 只做反代（见 web-engine.js 的说明）
+  if (webEngine) {
+    try { webEngine.start(); } catch (e) { process.stderr.write(`[web-engine] 启动失败: ${e.message}\n`); }
+  }
+});
+
+function shutdownEngine() {
+  try { if (webEngine) webEngine.stop(); } catch {}
+}
+process.on("SIGTERM", () => { shutdownEngine(); process.exit(0); });
+process.on("SIGINT", () => { shutdownEngine(); process.exit(0); });
+
+// 兜底：网关是一人一容器的唯一常驻服务，**崩了就整容器退出、在跑的任务全丢**。
+// 因此这里记日志但不退出 —— 与「宁可丢一条日志也不丢进程」的取舍一致。
+// ⚠️ 这是兜底而非常态：出现日志必须去修根因，别让它变成常驻噪声。
+process.on("uncaughtException", (e) => {
+  process.stderr.write(`[dsh-gw] uncaughtException（已兜住，未退出）: ${e && e.stack || e}\n`);
+});
+process.on("unhandledRejection", (e) => {
+  process.stderr.write(`[dsh-gw] unhandledRejection（已兜住）: ${e && e.stack || e}\n`);
 });

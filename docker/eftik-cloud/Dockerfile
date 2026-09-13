@@ -17,7 +17,7 @@ RUN apt-get update \
     && npm install -g @deepseek-ai/dsh@${DSH_VERSION} pnpm@${PNPM_VERSION} \
     && dsh --version
 
-COPY gateway.js web-ui.js web-auth.js login.html usage-probe.js sdk-session-resume.js entrypoint.sh /opt/gw/
+COPY gateway.js web-engine.js web-ui.js web-auth.js login.html usage-probe.js sdk-session-resume.js entrypoint.sh /opt/gw/
 COPY branding/ /opt/gw/branding/
 RUN chmod 0755 /opt/gw/entrypoint.sh && chmod 0644 /opt/gw/gateway.js \
     && mkdir -p /home/node/.dsh /workspace \

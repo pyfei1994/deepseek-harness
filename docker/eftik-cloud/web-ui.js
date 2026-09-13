@@ -3,20 +3,22 @@ const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
 const { createWebAuth } = require('./web-auth');
 
 const PUBLIC_PORT = Number(process.env.GW_WEB_PORT || 8080);
+// 上游 dsh web 由网关（web-engine.js）独占拉起并监听这个端口，这里只反代
 const UPSTREAM_PORT = Number(process.env.GW_WEB_UPSTREAM_PORT || 3080);
 const GATEWAY_PORT = Number(process.env.GW_PORT || 8090);
+// 容器内组件互调用的管理令牌（与网关同一个 env）
+const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || '';
 const API_PREFIX = '/_eftik/api';
 const PASSWORD_PATH = process.env.GW_WEB_PASSWORD_PATH || '/home/node/.dsh/eftik-web-password.sha256';
-const PLUGIN_RELOAD_PATH = process.env.GW_PLUGIN_RELOAD_PATH || '/home/node/.dsh/eftik-plugin-reload';
+// 网关写下的 dsh web launch token（进程归网关，这里只读）
+const TOKEN_PATH = process.env.GW_WEB_TOKEN_PATH || '/home/node/.dsh/eftik-web-token';
 // 登录页与品牌资源：容器内 /opt/gw/ 随镜像发布；背景图放 PVC 便于换肤不重建镜像
 const LOGIN_HTML_PATH = process.env.GW_LOGIN_HTML || path.join(__dirname, 'login.html');
 const BRANDING_DIR = process.env.GW_BRANDING_DIR || '/home/node/.dsh/branding';
 let launchToken = '';
-let web = null;
 let stopping = false;
 
 const auth = createWebAuth({ fs, passwordPath: PASSWORD_PATH });
@@ -98,12 +100,27 @@ function injectLogoutWidget(status, headers, upstream, res) {
   });
 }
 
-/** 重启上游 dsh web：换掉 launchToken 与内核侧的 WebUI 会话（「重置工作台」用） */
+/**
+ * 重启上游 dsh web：换掉 launchToken 与内核侧的 WebUI 会话（「重置工作台」用）。
+ * ⚠️ 进程归网关所有，这里只发一个带内网令牌的内部请求，由平面 B 引擎真正执行重启。
+ */
 function restartWeb(reason) {
-  launchToken = '';
-  if (!web) return false;
-  process.stderr.write(`[web-proxy] 重启 dsh web（${reason}）\n`);
-  try { web.kill('SIGTERM'); } catch {}
+  if (!GW_ADMIN_TOKEN) {
+    process.stderr.write('[web-proxy] 缺少 GW_ADMIN_TOKEN，无法请求重启 dsh web\n');
+    return false;
+  }
+  const body = JSON.stringify({ reason: reason || 'web-ui' });
+  const req = http.request({
+    hostname: '127.0.0.1', port: GATEWAY_PORT, path: '/internal/engine/restart-web', method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'content-length': Buffer.byteLength(body),
+      'x-gw-admin': GW_ADMIN_TOKEN,
+    },
+  }, (res) => { res.resume(); });
+  req.on('error', (e) => process.stderr.write(`[web-proxy] 请求重启 dsh web 失败: ${e.message}\n`));
+  req.end(body);
+  launchToken = '';   // 新 token 由引擎写入文件，watchFile 会读回来
   return true;
 }
 
@@ -285,36 +302,26 @@ function upstreamHeaders(req) {
   return headers;
 }
 
-function startWeb() {
-  launchToken = '';
-  web = spawn('dsh', ['web', '--host', '127.0.0.1', '--port', String(UPSTREAM_PORT), '--no-open'], {
-    cwd: process.env.GW_WORKDIR || '/workspace', env: process.env, stdio: ['ignore', 'pipe', 'pipe']
-  });
-  for (const stream of [web.stdout, web.stderr]) stream.on('data', chunk => {
-    const text = chunk.toString();
-    const match = text.match(/[?&]token=([^\s&]+)/);
-    if (match) launchToken = match[1];
-    process.stderr.write(`[dsh-web] ${text}`);
-  });
-  web.on('error', error => process.stderr.write(`[dsh-web] spawn error: ${error.message}\n`));
-  web.on('exit', code => {
-    process.stderr.write(`[dsh-web] exited ${code}${stopping ? '' : ', restarting'}\n`);
-    web = null;
-    if (!stopping) setTimeout(startWeb, 2000);
-  });
+/* ---------- 上游 dsh web：进程归网关，本文件只读 token 做反代 ----------
+
+   ⚠️ 为什么不再自己起 dsh web：平面 B 引擎（gateway.js + web-engine.js）需要独占这个进程。
+   两个进程共享同一个 DSH_HOME 会争 session.lock —— 那正是历史上 already exists /
+   already owned 那批 bug 的根因。所以「起进程 / 重启 / 插件档案热重载」全部归引擎，
+   这里退化为纯反代：只从网关写下的 token 文件读 launch token。
+*/
+function readTokenFile() {
+  try {
+    const t = fs.readFileSync(TOKEN_PATH, 'utf8').trim();
+    if (t && t !== launchToken) {
+      launchToken = t;
+      process.stderr.write('[web-proxy] 已从 token 文件读到新的 launch token\n');
+    }
+  } catch {}
 }
-startWeb();
-// 本地测试接缝：容器里 launchToken 由上面从 dsh stdout 解析；本机没有 dsh 二进制时
-// 打不通「已鉴权 → 放行到上游」这条链路（会停在 503「正在启动」），注入逻辑就没法测。
-// 设 GW_WEB_LAUNCH_TOKEN 可直接给定 token 跳过 spawn。必须放在 startWeb() 之后
-//（startWeb 会清空它）。生产不设此变量，行为无变化。
+// 本地测试接缝：本机没有 dsh 二进制时，可用 GW_WEB_LAUNCH_TOKEN 直接给定 token。
 if (process.env.GW_WEB_LAUNCH_TOKEN) launchToken = process.env.GW_WEB_LAUNCH_TOKEN;
-fs.watchFile(PLUGIN_RELOAD_PATH, { interval: 1000 }, (current, previous) => {
-  if (!stopping && current.mtimeMs !== previous.mtimeMs && web) {
-    process.stderr.write('[dsh-web] plugin profile changed, reloading\n');
-    web.kill('SIGTERM');
-  }
-});
+readTokenFile();
+fs.watchFile(TOKEN_PATH, { interval: 1000 }, () => readTokenFile());
 
 const server = http.createServer(async (req, res) => {
   // 小程序后端与 WebUI 共用一个 Sealos 公网地址。保留前缀转发到容器内网关，
@@ -467,6 +474,6 @@ server.on('upgrade', (req, socket, head) => {
 
 server.listen(PUBLIC_PORT, '0.0.0.0', () => process.stderr.write(`[web-proxy] listening on ${PUBLIC_PORT}\n`));
 
-function shutdown() { stopping = true; fs.unwatchFile(PLUGIN_RELOAD_PATH); try { if (web) web.kill('SIGTERM'); } catch {} server.close(() => process.exit(0)); }
+function shutdown() { stopping = true; try { fs.unwatchFile(TOKEN_PATH); } catch {} server.close(() => process.exit(0)); }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
