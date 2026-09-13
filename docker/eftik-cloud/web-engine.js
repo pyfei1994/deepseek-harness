@@ -250,23 +250,99 @@ function createWebEngine(cfg) {
 
   /**
    * 把网关的工作台级设置下发到这一轮会话上。
-   * 平面 B 是**会话级**（session/selectModel），比平面 A 的「只能 initialize」更强。
+   * 平面 B 全是**会话级**能力，比平面 A 的「只能 initialize + env」强得多。
+   * 三个旋钮的调用形式都是实测出来的（注意 scoped `agent:` 前缀在 HTTP 载体上是 404）：
+   *   模型   session/selectModel  { request: { sessionId, provider, model, reasoningEffort? } }
+   *   权限   commands/execute     { agentId, line: '/permission <preset>', submittedAttachments: [] }
+   *   预设   agentPresets/select  { agentId, agentPreset }
    * @param job 当前任务（只为把失败原因写进它的日志，不参与控制流）
    */
   async function applySettings(kernelId, settings, job) {
     if (!settings) return;
+    const warn = (m) => { log(`[web-engine] ${m}`); if (job && hooks.pushLog) safe(() => hooks.pushLog(job, m)); };
+
     if (settings.model || settings.provider) {
       try {
-        const sel = { provider: settings.provider || "deepseek-official", model: settings.model || "deepseek-chat" };
+        const sel = { sessionId: kernelId, provider: settings.provider || "deepseek-official", model: settings.model || "deepseek-chat" };
         if (settings.reasoning && settings.reasoning !== "off") sel.reasoningEffort = settings.reasoning;
-        await call("session/selectModel", { request: { sessionId: kernelId, ...sel } });
+        await call("session/selectModel", { request: sel });
         log(`[web-engine] 已选模型 ${sel.provider}/${sel.model}${sel.reasoningEffort ? " effort=" + sel.reasoningEffort : ""}`);
       } catch (e) {
         // 选模型失败不该让整轮挂掉：回退到内核默认模型，并把原因记进日志
-        log(`[web-engine] 选模型失败（回退默认）: ${e.message}`);
-        if (job && hooks.pushLog) safe(() => hooks.pushLog(job, `模型切换失败，已回退默认：${e.message}`));
+        warn(`模型切换失败，已回退默认：${e.message}`);
       }
     }
+
+    // 权限档：平面 B 下必须走 /permission 命令（原来靠每轮子进程的 env，切引擎后那条路没了）
+    if (settings.permissionMode) {
+      try {
+        await call("commands/execute", {
+          agentId: kernelId,
+          line: `/permission ${settings.permissionMode}`,
+          submittedAttachments: [],
+        });
+        log(`[web-engine] 已设权限档 ${settings.permissionMode}`);
+      } catch (e) {
+        warn(`权限档切换失败（沿用容器默认）：${e.message}`);
+      }
+    }
+
+    if (settings.agentPreset) {
+      try {
+        await call("agentPresets/select", { agentId: kernelId, agentPreset: settings.agentPreset });
+        log(`[web-engine] 已设 agent 预设 ${settings.agentPreset}`);
+      } catch (e) {
+        warn(`agent 预设切换失败（沿用默认 standard）：${e.message}`);
+      }
+    }
+  }
+
+  /**
+   * 读一个会话的当前能力快照：可用预设 / 可用模型 / 权限档（含当前值）。
+   * 权限档只能从 session/follow 首帧的 projections 里拿，所以这里开一条流只读首帧就关掉。
+   */
+  async function sessionOptions(kernelId) {
+    const out = { permissions: null, presets: null, models: null };
+    try {
+      const roster = await call("agentPresets/list", {});
+      out.presets = (roster && roster.presets) || [];
+    } catch (e) { log(`[web-engine] 读 agent 预设失败: ${e.message}`); }
+    try {
+      const cat = await call("session/modelCatalog", {});
+      out.models = cat || null;
+    } catch (e) { log(`[web-engine] 读模型目录失败: ${e.message}`); }
+    if (kernelId) {
+      try { out.permissions = await readPermissions(kernelId); }
+      catch (e) { log(`[web-engine] 读权限档失败: ${e.message}`); }
+    }
+    return out;
+  }
+
+  /** 开一条 follow 只取首帧 snapshot 里的 permissions projection */
+  function readPermissions(kernelId) {
+    return new Promise((resolve, reject) => {
+      if (!ws) return reject(new Error("WS 未连接"));
+      let done = false;
+      const finish = (fn, v) => { if (done) return; done = true; clearTimeout(timer); closeStream(sid); fn(v); };
+      const timer = setTimeout(() => finish(reject, new Error("读权限档超时")), 6000);
+      const sid = openStream(FOLLOW_ENDPOINT, {
+        request: { address: { kind: "session", sessionId: kernelId } },
+      }, {
+        onItem: (v) => {
+          if (!v || v.type !== "snapshot") return;
+          const vals = (v.projections && v.projections.values) || {};
+          finish(resolve, vals.permissions || null);
+        },
+        onError: (e) => finish(reject, new Error((e && e.message) || "读权限档失败")),
+      });
+    });
+  }
+
+  /** 拿一个可用的内核会话（优先复用已有）—— 读能力快照（如权限档）时需要 */
+  async function anyKernelSession() {
+    const ids = Object.values(kernelMap);
+    if (ids.length) return ids[ids.length - 1];
+    return ensureKernelSession("");
   }
 
   /* ---------- 一回合 ---------- */
@@ -400,12 +476,19 @@ function createWebEngine(cfg) {
       });
 
       // 发消息（requestId 幂等：同 id 重发内核直接返回 accepted，不会重复入队）
+      // 图片走 contentBlocks 内联（内核支持 {type:'image', data:<base64>, mimeType}），
+      // ⚠️ 绝不能拼进 task 字符串 —— 那边有 200000 字符硬校验。
+      const content = [{ type: "text", text: job.task }];
+      for (const img of (job.images || [])) {
+        content.push({ type: "image", data: img.data, mimeType: img.mimeType });
+      }
+      if (content.length > 1) log(`[web-engine] 附带 ${content.length - 1} 张内联图片`);
       call("session/prompt", {
         request: {
           requestId: `gw-${job.id}`,
           sessionId: kernelId,
           mode: "queue",
-          content: [{ type: "text", text: job.task }],
+          content,
         },
       }).catch((e) => finish("failed", e.message, hooks.classify ? hooks.classify(e.message).code : "PROMPT_ERROR", e.message));
     });
@@ -525,6 +608,9 @@ function createWebEngine(cfg) {
     kernelIdOf,
     ensureKernelSession,
     applySettings,
+    sessionOptions,
+    anyKernelSession,
+    readPermissions,
     runTurn,
     cancel,
     respond,

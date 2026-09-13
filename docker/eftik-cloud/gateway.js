@@ -120,6 +120,16 @@ const TIMEOUT_MS = Number(process.env.DSH_TIMEOUT_MS || 600000);
 const MAX_EVENTS = 200;
 const MAX_HISTORY = 20;
 const MAX_DOWNLOAD_BYTES = Number(process.env.GW_MAX_DOWNLOAD_MB || 200) * 1024 * 1024;
+/** 上传单文件上限（与小程序侧 30MB 对齐） */
+const MAX_UPLOAD_BYTES = Number(process.env.GW_MAX_UPLOAD_MB || 30) * 1024 * 1024;
+/** /chat 请求体上限：正文之外还要装内联图片的 base64（5MB 图 → 约 6.9MB，留余量） */
+const MAX_CHAT_BODY_BYTES = Number(process.env.GW_MAX_CHAT_BODY_MB || 16) * 1024 * 1024;
+/** 单轮最多几张图 */
+const MAX_CHAT_IMAGES = 4;
+/** 单张图 base64 后的上限 */
+const MAX_IMAGE_B64_BYTES = 7 * 1024 * 1024;
+/** 内核只认这四种图片 MIME（见 SdkEncodedImageBlock） */
+const IMAGE_MIME_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 const PERMISSION_MODES = ["read-only", "workspace-write", "danger-full-access"];
 // 与 dsh「llm-deepseek」provider 的 reasoningEffort 值域对齐（off/low/high/max）。
 // 旧值域 low|balanced|high 是纯提示词等级，从未真正开启 provider 推理，
@@ -237,14 +247,22 @@ const DEFAULT_SETTINGS = Object.freeze({
   provider: "",                 // 空 = deepseek-official
   permissionMode: process.env.DSH_PERMISSION_MODE || "workspace-write",
   reasoning: process.env.GW_PRESET_REASONING || "high",
+  agentPreset: "",              // 空 = 内核默认 standard
   background: process.env.GW_PRESET_BACKGROUND || "",
   memory: process.env.GW_PRESET_MEMORY || "",
 });
 
 /** 管理员判定：请求头 X-GW-Admin = GW_ADMIN_TOKEN 视为平台方（kitsume 后端持有，容器内用户拿不到） */
 const isAdmin = (req) => Boolean(GW_ADMIN_TOKEN) && req.headers["x-gw-admin"] === GW_ADMIN_TOKEN;
-/** 用户可见字段：产品模式下平台预设与权限对普通调用方隐藏 */
+/** 用户可见字段：产品模式下平台预设（人设记忆）对普通调用方隐藏 */
 const USER_HIDDEN_FIELDS = ["background", "memory"];
+
+/**
+ * 端用户**允许**自行调整的权限档。
+ * ⚠️ 为什么不给 danger-full-access：它在内核 preset 表里会把审批策略一并设成 never，
+ * 等于把整个容器交给模型，不该对端用户开放。
+ */
+const USER_PERMISSION_MODES = ["read-only", "workspace-write"];
 
 /** task_id -> job */
 const jobs = new Map();
@@ -310,6 +328,9 @@ function validateSettings(patch) {
   if (patch.provider !== undefined && (typeof patch.provider !== "string" || patch.provider.length > 128)) errors.push("provider 须为 ≤128 字符字符串");
   if (patch.permissionMode !== undefined && !PERMISSION_MODES.includes(patch.permissionMode)) errors.push(`permissionMode 须为 ${PERMISSION_MODES.join(" / ")}`);
   if (patch.reasoning !== undefined && !REASONING_LEVELS.includes(patch.reasoning)) errors.push(`reasoning 须为 ${REASONING_LEVELS.join(" / ")}`);
+  // agentPreset 取值来自内核磁盘目录（standard/minimal/ptc/cordis），不硬编码枚举：
+  // 只做形状校验，真正不存在的预设会让内核报 agent-preset/not-found（见 applySettings 的降级日志）。
+  if (patch.agentPreset !== undefined && (typeof patch.agentPreset !== "string" || patch.agentPreset.length > 64)) errors.push("agentPreset 须为 ≤64 字符字符串");
   for (const k of ["background", "memory"]) {
     if (patch[k] !== undefined && (typeof patch[k] !== "string" || patch[k].length > MAX_TEXT)) errors.push(`${k} 须为 ≤${MAX_TEXT} 字符字符串`);
   }
@@ -1536,6 +1557,39 @@ function readBody(req, limit = 1 << 20) {
 }
 
 let dshVersion = "";
+
+/** 读原始字节流（上传用）。超限返回 null，由调用方回 413。 */
+function readRawBody(req, limit) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > limit) { try { req.destroy(); } catch {} resolve(null); return; }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", () => resolve(null));
+  });
+}
+
+/**
+ * 归一内联图片：只留内核认的四种 MIME，逐张限长、限量。
+ * ⚠️ 图片**不能拼进 task 字符串** —— /chat 对 task 有 200000 字符硬校验，
+ * 大 base64 会被直接 400。必须走 contentBlocks 单独传。
+ */
+function normalizeImages(input) {
+  if (!Array.isArray(input)) return [];
+  const out = [];
+  for (const it of input.slice(0, MAX_CHAT_IMAGES)) {
+    if (!it || typeof it.data !== "string") continue;
+    const mime = String(it.mimeType || "").toLowerCase();
+    if (!IMAGE_MIME_TYPES.includes(mime)) continue;
+    if (it.data.length > MAX_IMAGE_B64_BYTES) continue;
+    out.push({ data: it.data, mimeType: mime, name: String(it.name || "").slice(0, 128) });
+  }
+  return out;
+}
 try { dshVersion = execSync("dsh --version", { encoding: "utf8" }).trim(); } catch {}
 
 /** SSE：把 job 的增量事件与最终结果推给调用方。
@@ -1773,9 +1827,12 @@ const server = http.createServer(async (req, res) => {
       if (errors.length) return send(res, 400, { error: errors.join("; ") });
       const admin = isAdmin(req);
       if (PRODUCT_MODE && !admin) {
-        // 用户侧：平台预设不可改（静默忽略，不确认存在）；权限锁死为部署值
+        // 用户侧：平台预设（人设记忆）静默忽略；权限档只允许在安全子集内选，
+        // 越界值静默丢弃而不是报错（不确认危险档位的存在）。
         for (const k of USER_HIDDEN_FIELDS) delete patch[k];
-        if (patch.permissionMode !== undefined && patch.permissionMode !== DEFAULT_SETTINGS.permissionMode) delete patch.permissionMode;
+        if (patch.permissionMode !== undefined && !USER_PERMISSION_MODES.includes(patch.permissionMode)) {
+          delete patch.permissionMode;
+        }
       }
       const next = { ...loadSettings(), ...patch };
       saveSettings(next);
@@ -1785,6 +1842,44 @@ const server = http.createServer(async (req, res) => {
       const admin = isAdmin(req);
       saveSettings({ ...DEFAULT_SETTINGS }); // 重置保留平台 env 预设
       return send(res, 200, viewSettings({ ...DEFAULT_SETTINGS }, admin));
+    }
+
+    /**
+     * 端用户可选项：模型清单 / 推理档 / 权限档 / agent 预设。
+     * 全部从内核实时读（模型来自 session/modelCatalog、预设来自 agentPresets/list、
+     * 权限档来自 follow 首帧的 permissions projection），平台不维护第二份清单。
+     */
+    if (req.method === "GET" && url.pathname === "/settings/options") {
+      const admin = isAdmin(req);
+      const empty = { models: [], modelGroups: [], presets: [], permissions: [], reasoning: REASONING_LEVELS };
+      if (!webEngine) return send(res, 200, { ...empty, engine: ENGINE });
+      let raw = {};
+      try {
+        raw = await webEngine.sessionOptions(await webEngine.anyKernelSession());
+      } catch (e) {
+        return send(res, 200, { ...empty, engine: ENGINE, warning: `读取内核能力失败：${e.message}` });
+      }
+      const presetNames = new Map((raw.presets || []).map((p) => [p.id, p.name || p.id]));
+      const permNames = new Map(((raw.permissions && raw.permissions.options) || []).map((p) => [p.value, p.name || p.value]));
+      const permOptions = ((raw.permissions && raw.permissions.options) || [])
+        .filter((p) => admin || USER_PERMISSION_MODES.includes(p.value))
+        .map((p) => ({ value: p.value, name: p.name || p.value }));
+      const groups = (raw.models && raw.models.groups) || [];
+      return send(res, 200, {
+        engine: ENGINE,
+        current: viewSettings(loadSettings(), admin),
+        reasoning: REASONING_LEVELS,
+        // 中文名优先（内核给 agent 预设带了中文名，权限档只有 key，就用 key）
+        permissions: permOptions.length ? permOptions : USER_PERMISSION_MODES.map((v) => ({ value: v, name: permNames.get(v) || v })),
+        permissionCurrent: (raw.permissions && raw.permissions.currentValue) || null,
+        presets: (raw.presets || []).map((p) => ({ value: p.id, name: presetNames.get(p.id) || p.id, description: p.description || "" })),
+        modelGroups: groups.map((g) => ({
+          provider: g.id,
+          name: g.name || g.id,
+          models: (g.models || []).map((m) => ({ value: m.id, name: m.name || m.id, description: m.description || "" })),
+        })),
+        modelDefault: (raw.models && raw.models.default) || null,
+      });
     }
 
     /* ---------- 技能 ---------- */
@@ -1902,6 +1997,40 @@ const server = http.createServer(async (req, res) => {
       const r = listFiles(url.searchParams.get("path"));
       return send(res, r.code, r.body);
     }
+
+    /**
+     * 上传文件到工作区（平面 B 下附件两条路：图片可内联 base64 让模型「看见」，
+     * 其它文件只能落进 workspace 再由模型自己去读）。
+     *
+     * 用 **raw body** 而不是 multipart：网关零依赖，为一个上传不值得引 multipart 库。
+     * 目标路径走 query：`POST /files/upload?path=/docs/a.pdf`（相对工作区）。
+     * 落盘前必须过 safeResolve（防目录穿越），并做「临时文件 + rename」原子落盘，
+     * 否则模型可能读到半截文件。
+     */
+    if (req.method === "POST" && url.pathname === "/files/upload") {
+      const rel = url.searchParams.get("path") || "";
+      if (!rel.trim()) return send(res, 400, { error: "path 必填" });
+      const abs = safeResolve(rel);
+      if (!abs) return send(res, 400, { error: "路径不合法（不能越出工作区）" });
+      let st = null;
+      try { st = fs.statSync(abs); } catch {}
+      if (st && st.isDirectory()) return send(res, 400, { error: "目标是一个目录" });
+      const buf = await readRawBody(req, MAX_UPLOAD_BYTES);
+      if (buf === null) {
+        return send(res, 413, { error: `文件超过上限 ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB` });
+      }
+      if (!buf.length) return send(res, 400, { error: "文件内容为空" });
+      try {
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        const tmp = `${abs}.part-${Date.now()}`;
+        fs.writeFileSync(tmp, buf);
+        fs.renameSync(tmp, abs);
+      } catch (e) {
+        return send(res, 500, { error: "写入失败：" + e.message });
+      }
+      const normalized = path.posix.normalize("/" + rel.replace(/\\/g, "/"));
+      return send(res, 200, { ok: true, path: normalized, size: buf.length });
+    }
     if (req.method === "GET" && url.pathname === "/files/download") {
       const r = openDownload(url.searchParams.get("path"));
       if (r.error) return send(res, r.code, { error: r.error });
@@ -2003,8 +2132,23 @@ const server = http.createServer(async (req, res) => {
 
     /* ---------- 任务 ---------- */
     if (req.method === "POST" && url.pathname === "/chat") {
-      const body = await readBody(req, 2 << 20);
+      // 上限放宽到 16MB：正文之外还可能带内联图片的 base64
+      const body = await readBody(req, MAX_CHAT_BODY_BYTES);
       const settings = loadSettings(); // 提交时刻的设置快照
+
+      // 附件：图片内联给模型看；其它文件已经落在工作区，这里只在文本里补一句路径
+      const images = normalizeImages(body.images);
+      if (Array.isArray(body.files) && body.files.length) {
+        const lines = body.files
+          .filter((f) => f && typeof f.path === "string")
+          .slice(0, 10)
+          .map((f) => `- ${String(f.path)}${f.name ? `（${String(f.name).slice(0, 128)}）` : ""}`);
+        if (lines.length) {
+          const note = `[已上传到工作区，请按需读取]\n${lines.join("\n")}\n`;
+          body.message = body.message ? `${note}\n${body.message}` : note;
+        }
+      }
+      if (images.length && !body.message) body.message = "请查看我上传的图片";
 
       // sessionId 处理：
       //   给出时 → 无则新建会话，有则续上（并把本轮消息记进会话记录）；
@@ -2036,6 +2180,8 @@ const server = http.createServer(async (req, res) => {
       }
       const id = `t-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const job = newJob(id, task, settings, null, sessionId);
+      // 内联图片：引擎会把它们作为额外 contentBlocks 塞进 session/prompt
+      if (images.length) job.images = images;
       // 单次任务覆盖执行 profile（排障用；缺省走 settings.stream 决定的 sdk）
       if (body.profile === "headless") job.dshProfile = "headless";
       jobs.set(id, job);
