@@ -1,6 +1,6 @@
 # eftik-dsh-cloud 网关接口文档
 
-> 适用版本：镜像 `eftik-dsh-cloud:0.6.23`（网关 `gateway/1.8`，内核 `@deepseek-ai/dsh 0.1.5-rc.2`）
+> 适用版本：镜像 `eftik-dsh-cloud:0.6.24`（网关 `gateway/1.9`，内核 `@deepseek-ai/dsh 0.1.5-rc.2`）
 >
 > 镜像 tag 自 0.5.0 起与网关版本对齐（0.5.0 = 网关 v0.5）；镜像自身修订从第三位递增（0.5.1、0.5.2…），网关升版则前两位跟随
 > 更新时间：2026-09-13
@@ -622,6 +622,10 @@ run 记录：`{id(网关任务id), at, status(done/failed/timeout/running), erro
 ---
 
 ## 7. 版本记录
+
+| 网关版本 | 镜像 tag | 变更 |
+|----------|----------|------|
+| gateway/1.9 | 0.6.24 | **执行引擎整体切到平面 B（Typert Remote）**。新增 `web-engine.js`：网关**独占**拉起 `dsh web`，用它的远程平面跑任务，代替原来「每轮 spawn 一个 sdk 子进程」。**对外接口与 SSE 形态一字未改**（复用既有 `job.stream`/`waitStream`/`streamTask`），中台与小程序无感；`GW_ENGINE=web\|sdk` 可一键回退。**新增/变更**：① `DELETE /task/{id}` 改为内核原生 `session/cancel`，终态 `cancelled` + `error_code=CANCELLED`（保留已吐出的正文，不再伪装成「退出码 null」的 failed）；② 新增 `POST /task/{id}/interaction` + SSE `interaction` 事件（AI 提问 / 工具审批，来自 `$events` 的 waterfall 帧）；③ `GET /task/{id}` 新增 `error_detail`（英文原文）与 `pending_interactions`；④ 错误归一：`message` 改中文、`error_code` 扩成枚举（SESSION_LOCKED/CANCELLED/NO_APPROVAL_CHANNEL/MODEL_AUTH/MODEL_RATE_LIMIT/MODEL_ERROR/WORKSPACE_FULL/KERNEL_NOT_READY/SESSION_LOST/TIMEOUT）；⑤ **进程归属变更**：`dsh web` 归网关所有，`web-ui.js` 不再自己 spawn（两进程共用 `DSH_HOME` 会争 `session.lock`），launch token 由网关写 `/home/node/.dsh/eftik-web-token` 供 web-ui 读取，「重置工作台」改走 `POST /internal/engine/restart-web`（只认 `X-GW-Admin`）。**白拿的能力**：原生 `assistant-stream` 打字机（不再按 `dt[]` 回放模拟）、会话级 `session/selectModel`、`agentPresets/*`、follow 的 projections（permissions/modelSelection/plan/todos）。**并彻底消灭两个历史 bug**：`session "..." already exists`（同会话第二轮必炸）与 `already owned by an active write handle`（SESSION_LOCKED）—— 二者根因都是 sdk 子进程与 `dsh web` 跨进程争 flock，现在只有一个进程。⚠️ **两个引擎绝不能混用同一会话**。 |
 
 | 网关版本 | 镜像 tag | 变更 |
 |----------|----------|------|
