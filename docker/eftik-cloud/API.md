@@ -370,6 +370,7 @@ Content-Type: application/json
 | `status` | `queued` → `running` → `done` / `failed` / `timeout`（终态） |
 | `reply` | agent 最终回答（仅 done 有值） |
 | `error` | 失败原因（failed/timeout 时有值） |
+| `error_code` | 机器可读的稳定错误分类（无特殊分类为 `""`）。当前取值：`SESSION_LOCKED` = 该会话被另一进程（WebUI 常驻 `dsh web`）独占写入，**唯一出路是换新会话**（详见下方说明） |
 | `events` | 执行过程日志行（思考/工具调用，最多 200 条），可展示为"分身正在干活"动态 |
 | `elapsed_ms` | 耗时（运行中为已耗时） |
 | `usage` | 任务级 token 消耗汇总（运行中/未采集为 `null`）。字段为 provider 精确上报值：`inputTokens` 未命中缓存输入、`outputTokens` 输出（含 reasoning）、`cacheReadTokens` 缓存命中（单价约为普通输入 1/10，计费建议三段分开）、`cacheWriteTokens` 缓存写入、`totalTokens` 官方总计、`calls` LLM 调用次数 |
@@ -397,13 +398,44 @@ data: {"status":"done","reply":"好的，我来写一个。","error":"","elapsed
 | `answer` | **正文增量**：SDK `session.event` → `assistant/chunk` 中 `chunk.type === "text-delta"` 的 `chunk.text`，原样下发，前端累加即得打字机效果。完整正文 = 所有 answer 的 `text` 按序拼接（与 `done.reply` 一致） |
 | `thinking` | **思考增量**：同一路径下 `chunk.type === "reasoning-delta"` 的 `chunk.text`，剥离标签后下发（ANSI 已清除）。仅在 `settings.reasoning` 非 `off` 且所选模型支持思考时才产出 |
 | `log` | 运行日志行（工具调用 `tool/start`/`tool/end`、`step/start`、`turn/start` 等），可展示为"正在干活"动态 |
-| `done` | 终态，携带 `reply`/`error`/`elapsed_ms`/`usage`，随后服务端关闭连接 |
+| `done` | 终态，携带 `reply`/`error`/`error_code`/`elapsed_ms`/`usage`，随后服务端关闭连接 |
 
 - **流式来源**：网关默认以 `--profile sdk` 启动 dsh，走 stdio JSON-RPC；`session.event` 通知按 chunk 推送，延迟 ≈ 模型 token 输出延迟（实测首片 1.3–2.2s）
 - 任务终态由 `turn/end` 事件决定（SDK 是常驻会话，`turn/end` 后网关补发 `shutdown` 并兜底 kill），`done` 事件随之发出
 - 断开后可回退用 `GET /task/{task_id}` 补拉全量（`reply` 在任务运行期间即为已产出的部分正文）
 - 调用方按 `answer` / `thinking` 分流：正文渲染 markdown，思考渲染为可折叠的思考块
 - 兼容开关：`DSH_FORCE_HEADLESS=1` 或请求体 `{"profile":"headless"}` 可退回 headless（**无逐字流式**，仅在任务结束一次性给出完整正文，或从 stdout 分块下发）
+
+### `error_code: "SESSION_LOCKED"` —— 会话被 WebUI 独占
+
+**症状**：小程序对某会话发消息 → 报
+`SDK: session "s-xxx" is already owned by an active write handle`。
+
+**根因**：dsh 内核的会话持久化（`dsh-session-persistence-jsonl`）是**单写者模型** ——
+每个会话目录下有一把 `session.lock` 的 `flock(2)` 排他锁。工作台 WebUI 的 `dsh web`
+是**常驻进程**，一旦在浏览器里打开过某会话就会持有该锁且不放手
+（内核刻意不做空闲过期，注释原话：*"there is deliberately no expiry that could
+expropriate a stalled writer whose resumed appends would tear the log"*）。
+此时网关起的 SDK 子进程（每轮一个全新进程）去 resume 同一 sessionId
+→ `claimWrite` 撞上活跃锁 → 报错。
+
+**⚠️ 关键事实（2026-09-13 fd 级实测确认）**：
+
+| 场景 | 锁状态 |
+|---|---|
+| `dsh web` 空转（无人打开会话） | FREE（不持锁） |
+| 浏览器打开会话 | LOCKED（web 进程持锁） |
+| **关闭浏览器标签页 / 关掉整个浏览器** | **LOCKED 不变** —— **不释放** |
+| `dsh web` 进程退出（含 SIGKILL / 容器重启） | FREE |
+
+即：**锁跟着进程走，不跟浏览器连接走**。因此调用方**绝不能**提示用户
+「请关闭浏览器标签页后重试」—— 那没有任何作用。
+
+**唯一有效解法 = 新建会话**（换一个 sessionId，绕开被占用的那把锁）。
+原会话记录不会丢，`GET /sessions` + `/sessions/{id}` 仍可回看。
+
+网关已把该错误归一为 `error_code: "SESSION_LOCKED"`，调用方按 code 分流即可，
+不要匹配易变的报错文案。
 
 ### DELETE /task/{task_id}
 
@@ -566,10 +598,13 @@ run 记录：`{id(网关任务id), at, status(done/failed/timeout/running), erro
 | gateway/1.7 | 1.7.0 | 镜像 `0.6.17`：**修复跨进程复用会话 id 报 `session "..." already exists`（第二句必炸）**。根因：SDK profile 的 `createSession(sessionId)` 只调 `ctx.agents.create()`，**没有 resume 分支**；而内核有磁盘会话持久化（`dsh-session-persistence-jsonl`，`/home/node/.dsh/sessions/--workspace--/<sid>/`），新进程启动会把磁盘会话恢复进内存 store，于是同一 sessionId 第二次创建时 `SessionStore.prepare(id)` 命中 `store.has(sessionId)` 直接抛错。对照 Web profile 用的 `dsh-api-session-controller`：它有正确的三步判定 `createOrAdopt`（内存 live → 磁盘 `sessionQuery.observeSession` + `agents.resume` → `create`），所以 Web 端可以随意切换会话、续聊、回看。**修复方式（零内核文件改动）**：新增外挂插件 `sdk-session-resume.js`，经 `--patch` insert 注入 sdk profile，在插件加载时替换 `HarnessSdkJsonRpcServer.prototype.createSession`，把 Web 端 `createOrAdopt` 的语义补上（内存 → 磁盘 resume → create 三步；cwd 不一致时明确报错不降级，避免同一 id 出现两个会话）。实测（真实 API Key，跨进程两轮）：第 1 轮 `磁盘无会话，走 create`，第 2 轮 `resume 成功`；第 2 轮仅发「暗号是什么」即正确答出第 1 轮设定的暗号，且 `usage.cacheReadTokens=7040` 证明上下文由内核侧续接、**未经网关拼 history**。该插件为纯外挂，上游在 SDK profile 补上 resume 后删除 patch entry 即回归官方实现 |
 | gateway/1.7 | 1.7.1 | 镜像 `0.6.20`：**修复工作台 Web 端打不开 —— `ERR_TOO_MANY_REDIRECTS`（输了密码后进入死循环）**。根因：`web-ui.js` 用「请求里有没有 cookie」判断是否需要注入 `dsh web` 的 launch token（`if (target === '/' && !req.headers.cookie)`）。而浏览器在同域下必然带着无关 cookie（同域小程序通道、Sealos 平台自身等），条件恒为假 → 从不注入 token → 上游 `dsh web` 鉴权失败 → `303 location: /`（上游刻意抹掉 token）→ 浏览器带着同一批 cookie 再请求 → 再 303，无限循环。**修复（两处）**：① 新增 `hasDshCookie()`，用 `/(?:^|;\s*)dsh-auth-[^=]+=/` 精确识别 dsh 自己的 cookie，不再拿「有无任意 cookie」当判据；请求侧仅在无 dsh cookie 且 URL 无 token 时注入（且不再限于 `/`）。② **响应侧 3xx 兜底**：上游 3xx 且 `Location` 指向本域却没有 token 时补上 token，让浏览器下一跳用 token 换取合法 cookie；但若本次响应已下发 `set-cookie`（认证交接已完成）则原样放行。③ **响应侧 401 兜底**：浏览器持有「名字像 dsh-auth-* 但已失效」的 cookie（如 `dsh web` 重启后 launchToken 变了）时，请求侧会因 `hasDshCookie` 为真而跳过注入，上游直接回 401（非 303），3xx 兜底覆盖不到 → 用户被挡在门外。此时用带 token 的 URL 自动重试一次。**必须限制为无请求体方法（GET/HEAD）**，且重试前要 `req.resume()` + `proxy.destroy()` 让原始连接落地，否则连接一直挂着，客户端表现为超时（`HTTP=000`）。
 
-> ⚠️ **踩坑记录一（务必保留此判据）**：曾尝试把请求侧改成「只要 URL 无 token 就总是注入」，想一举解决脏 cookie 的 401 —— **结果在生产上造出新的死循环**：上游 `dsh web` 每次拿到带 token 的请求都会**重新种 cookie 并 303 `/`**，于是 `hop1 303 → hop2 303 → …` 永不收敛（实测 20 跳）。**所以「已有 dsh cookie 就跳过注入」这一步绝不能省**，脏 cookie 的 401 必须走上面的「401 兜底重试」路径解决，而不是靠无条件注入。
+：曾尝试把请求侧改成「只要 URL 无 token 就总是注入」，想一举解决脏 cookie 的 401 —— **结果在生产上造出新的死循环**：上游 `dsh web` 每次拿到带 token 的请求都会**重新种 cookie 并 303 `/`**，于是 `hop1 303 → hop2 303 → …` 永不收敛（实测 20 跳）。**所以「已有 dsh cookie 就跳过注入」这一步绝不能省**，脏 cookie 的 401 必须走上面的「401 兜底重试」路径解决，而不是靠无条件注入。
 
 > ⚠️ **踩坑记录二**：**验证必须跑真实的 `web-ui.js`，不能用手抄的副本或凭想象写 mock。** mock 若没复刻「带 token 一律重种 cookie + 303」这一上游行为，就测不出死循环；手抄副本曾漏掉 `req.resume()` 导致 401 重试挂起。本次最终验证方式：把 `web-ui.js` 复制到独立目录（避开仓库根的 `type: module` 干扰），用 `sed` 把 `startWeb();` 换成 `launchToken = 'SECRET';` 跳过 spawn，再配一个如实复刻生产行为的 mock 上游（3998）+ cookie jar 跟随重定向脚本。
 
 > 实测（node mock 按生产行为复刻 + 浏览器 cookie jar 跟随重定向，上限 20 跳）：修复前「带无关 cookie」「带脏 dsh cookie」均 20 跳死循环；修复后四场景全部收敛 —— 无 cookie 2 跳 / 带无关 cookie 2 跳 / 带脏 cookie 2 跳 / 带合法 cookie 1 跳，均 200。生产实测 A、B 两场景均 `303 → 200`（2 跳） |
 | gateway/1.6 | 1.6.0 | 镜像 `0.6.16`：内核升级 `@deepseek-ai/dsh 0.1.5-rc.1 → 0.1.5-rc.2`（合并上游 `0.1.5-rc.2` 到 `eftik-cloud`，冲突仅 `.gitignore`，gateway 定制 3493 行完整保留；rc.2 的 `text-chunks`/`reasoning-chunks` 结构与 rc.1 一致，gateway/1.5 的事件适配直接适用）。**修复对话记录恒为空 / 每次进入都是新会话**：原 `POST /chat` 仅在 `body.sessionId` 非空时才落会话记录，未给出时 `sessionStore = null` → `GET /sessions` 永远返回空数组；且同一路径下内核 sessionId 退化为 `task-<id>`，多轮对话实际断链。现改为：未带 sessionId 且是对话请求（有 `message`、非一次性 `task`）时，网关自己生成一个会话 id，正常走记账 + 传给内核 + 随响应回传 `session_id`。配套中台侧 `DshWorkspaceService` 改用 `chatRaw()` 认下回传的 `session_id` 并补写首轮 user 消息归属（原 `chat()` 只取 `task_id` 把 session_id 丢弃）。一次性任务与已有 sessionId 的调用方行为完全不变 |
 | gateway/1.7 | 1.7.2 | 镜像 `0.6.21`：**工作台登录页改版 —— 用自研品牌登录页替换浏览器原生 Basic Auth 弹框**。背景：原先 `WWW-Authenticate: Basic` 会弹一个无法自定义样式的浏览器原生对话框，与「狐分身」品牌完全不搭。**改造内容**：① 新增 `web-auth.js`（零依赖），实现基于 **HMAC-SHA256 签名 Cookie** 的浏览器会话：cookie 名 `eftik-session`（与上游 dsh 自己的 `dsh-auth-*` 严格区分），值为 `base64url("exp=<毫秒>").<hex签名>`，`HttpOnly + SameSite=Lax`；**签名密钥派生自密码哈希**，因此改密码会自动失效所有旧会话（这是想要的行为）。② 新增 `login.html` 单文件登录页（内联 CSS/JS，**不引入 Vue 或任何 UI 组件库**，无构建链、不增加 npm 依赖）：浅色暖调卡片呼应品牌插画，含登录面板与「首次设置密码」面板，密码显隐切换、记住我（30 天 / 不勾 12 小时）、内联错误提示与抖动动画、移动端自适应。③ `web-ui.js` 新增 `/_eftik/{login,logout,session,setup}` 四个接口与 `GET /branding/*` 静态资源路由，并按调用方形态分流：**浏览器导航** 失败 → `302 /_eftik/login`（或直接返回登录页）；**API 调用** 失败 → 仍回 `401 + WWW-Authenticate`，**小程序 / 脚本 / curl 的 Basic Auth 通道完全不受影响**（三种调用方共存）。④ 登录失败限流：滑动窗口 5 分钟内最多 10 次。⑤ `POST /_eftik/setup` 仅在尚未配置密码时可用，避免已配置后被匿名重置。⑥ 登录页背景图从 PVC 的 `/home/node/.dsh/branding/bg.*` 读取（镜像内置出厂默认，`entrypoint.sh` 只在 PVC 无同名文件时才拷贝，便于运维直接丢图换肤而无需重建镜像）。⑦ 登录页「已登录却回退到登录页」时 `302 /` 直接送进工作台。**注意**：镜像 tag 从 0.6.20 → 0.6.21，但网关协议版本保持 `gateway/1.7`（`/web-access` 等既有接口签名未变）。 |
+| gateway/1.8 | 1.8.0 | 镜像 `0.6.22`：**新增稳定错误码 `error_code`，修复「小程序 ↔ WebUI 交叉使用必炸」的用户体验**。背景：gateway/1.7（resume 插件）修好了「第二句必炸」，但引入新问题 —— 在浏览器里打开过某会话后，回小程序对**同一会话**发消息会报 `session "s-xxx" is already owned by an active write handle`（内核跨进程排他写锁 `session.lock` 被 `dsh web` 常驻进程持有）。**本版本改动**：① `/task`、`/task/{id}`、`/task/{id}/stream` 的终态新增 `error_code` 字段（无特殊分类为 `""`），识别到 `already owned by an active write handle` 时置为 `SESSION_LOCKED`；② 覆盖两处错误路径（JSON-RPC error 响应 + `turn/end` 的 `reason.error`），`job` 对象新增 `errorCode` 字段并在三处上报点透出。**⚠️ 关键实测结论（决定了提示语怎么写）**：关闭浏览器标签页**不会**释放该锁（锁跟 `dsh web` 进程走，内核无空闲过期）；唯一释放路径是该进程退出/容器重启。所以**唯一有效出路是新建会话**，提示语绝不能引导用户去关标签页。配套：中台 `DshWorkspaceService` 透传 `errorCode`（`dsh_chat_task` 新增 `error_code` 列，V68 迁移），小程序 `dsh-chat` 捕获后弹出「会话正在浏览器中打开」引导面板（「新建会话继续」/「我知道了」），选前者会自动换新会话并重发刚才那条消息 |
+
+> ⚠️ **排查备忘（本次定位手段，可复用）**：验证「关标签页是否释放锁」**不需要真实浏览器** —— `session/follow` 就是「打开会话」的 RPC（触发 `promote` → `agents.resume` → 拿写锁），用 Node 24 内置 `WebSocket` 连 `/api/remote.mux` 直接调即可。三处帧格式易错：① `endpoint` 是 `namespace/method`（如 `session/follow`），**不是** descriptor id `@包名#方法`；② `payload` 必须包一层 `{args:{...}}`；③ 参数名严格按 descriptor（`follow` 的参数名是 `request`）。锁状态判据用 `flock -n <session.lock>` **试锁**（文件存在 ≠ 被持有，该文件永不删除）；fd 级证据看 `cat /proc/locks`（形如 `FLOCK ADVISORY WRITE <pid>`）与 `ls -l /proc/<web-pid>/fd | grep session.lock`。实测：客户端断开后 `flock` 仍 BLOCKED 且 web 进程仍持 1 个 fd，唯 `kill -9` web 进程后转 FREE。 |

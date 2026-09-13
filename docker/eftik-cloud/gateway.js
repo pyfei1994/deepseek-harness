@@ -86,7 +86,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execSync } = require("child_process");
 
-const GATEWAY_VERSION = "gateway/1.7";
+const GATEWAY_VERSION = "gateway/1.8";
 const PORT = Number(process.env.GW_PORT || 8090);
 const GW_TOKEN = process.env.GW_TOKEN || "";
 const GW_ADMIN_TOKEN = process.env.GW_ADMIN_TOKEN || "";
@@ -723,6 +723,8 @@ function newJob(id, task, settings, source, sessionId) {
   const job = {
     id, task, settings,
     status: "queued", reply: "", error: "", events: [], createdAt: Date.now(),
+    // 稳定错误码（如 SESSION_LOCKED），供中台/小程序分流；空串=无特殊分类。
+    errorCode: "",
     stream: [],    // [{seq,kind:'answer'|'thinking',text,t}] 增量事件（正文/思考）
     seq: 0,        // 增量事件序号游标
     waiters: [],   // 等待新增量的订阅回调（streamTask 用）
@@ -840,6 +842,34 @@ function sdkErrorMessage(err) {
   const message = err.message || (err.data && err.data.message) || JSON.stringify(err);
   const code = err.code || (err.data && (err.data.code || err.data.type)) || "";
   return { message: String(message), code: code ? String(code) : "" };
+}
+
+/**
+ * 会话被别的进程独占写入（跨进程排他写锁 session.lock）时的稳定错误码。
+ *
+ * 场景：用户在 WebUI（常驻 `dsh web` 进程）打开了某个会话，再回小程序对
+ * 同一 sessionId 发消息 → 内核 `claimWrite` 撞上 flock → 抛
+ *   `session "s-xxx" is already owned by an active write handle`
+ *
+ * ⚠️ 关键事实（2026-09-13 fd 级实测确认）：
+ *   - 关闭浏览器标签页**不会**释放该锁；锁跟着 `dsh web` 进程走（无空闲过期）。
+ *   - 唯一释放路径 = `dsh web` 进程退出（含 SIGKILL / 容器重启）。
+ *   所以小程序侧遇到本错误时，**唯一有效出路是新建会话**，
+ *   绝不要提示用户「请关闭浏览器标签页」——那没用。
+ *
+ * 网关把它归一为一个稳定的 errorCode 交给中台/小程序分流，
+ * 而不是让前端去匹配易变的中英文字符串。
+ */
+const ERROR_CODE_SESSION_LOCKED = "SESSION_LOCKED";
+
+/** 判断一条 SDK 错误是否是「会话被别的进程占用」。 */
+function isSessionLockedError(message) {
+  return /is already owned by an active write handle/i.test(String(message || ""));
+}
+
+/** 给 job 打上稳定错误码（供 /task、/task/:id 与流式终态透出）。 */
+function tagJobErrorCode(job, errorCode) {
+  job.errorCode = errorCode || "";
 }
 
 /**
@@ -1028,8 +1058,12 @@ function handleSdkLine(job, line) {
       // 已进入终态（done/timeout）的任务不再被后续 error 覆盖：这类错误几乎都来自
       // 收尾阶段的竞态（见上），此时用户已经拿到完整回答，报错反而误导。
       if (job.status === "done" || job.status === "timeout") return;
+      const parsedErr = sdkErrorMessage(msg.error);
       job.status = "failed";
-      job.error = "SDK: " + (msg.error.message || JSON.stringify(msg.error));
+      job.error = "SDK: " + parsedErr.message;
+      // 会话被 WebUI 常驻进程独占写入 → 打稳定错误码，让中台/小程序能分流
+      // 出「该会话正在浏览器中被使用」的专用提示（见 isSessionLockedError 注释）。
+      if (isSessionLockedError(job.error)) tagJobErrorCode(job, ERROR_CODE_SESSION_LOCKED);
       try { job.child && job.child.kill("SIGKILL"); } catch {}
       return;
     }
@@ -1103,6 +1137,7 @@ function handleSdkLine(job, line) {
         const parsed = sdkErrorMessage(err);
         job.error = "SDK: " + parsed.message;
         if (parsed.code) job.error += " (" + parsed.code + ")";
+        if (isSessionLockedError(job.error)) tagJobErrorCode(job, ERROR_CODE_SESSION_LOCKED);
         if (job.events.length < MAX_EVENTS) {
           job.events.push({ t: Date.now(), text: job.error });
         }
@@ -1430,6 +1465,7 @@ async function streamTask(req, res, job) {
       }
       write("done", {
         status: job.status, reply: job.reply, error: job.error,
+        error_code: job.errorCode || "",
         elapsed_ms: (job.finishedAt || Date.now()) - job.createdAt,
         usage: job.usage || null,
       });
@@ -1825,6 +1861,7 @@ const server = http.createServer(async (req, res) => {
       if (!job) return send(res, 404, { error: "task not found" });
       return send(res, 200, {
         status: job.status, reply: job.reply, error: job.error,
+        error_code: job.errorCode || "",
         events: job.events, elapsed_ms: (job.finishedAt || Date.now()) - job.createdAt,
         usage: job.usage || null,
       });
